@@ -1,0 +1,512 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 1. Global Safety Net (Default Deny)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Connection check endpoint (read-only)
+    match /test/connection {
+      allow get: if true;
+    }
+
+    // --- Primitive Helpers ---
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidUsername(u) {
+      return u is string && u.size() >= 2 && u.size() <= 64 && u.matches('^[a-z0-9._\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function userDoc(uid) {
+      return get(/databases/$(database)/documents/users/$(uid));
+    }
+
+    function userExists(uid) {
+      return isValidId(uid) && exists(/databases/$(database)/documents/users/$(uid));
+    }
+
+    function isActiveUser(uid) {
+      return userExists(uid) && userDoc(uid).data.isActive == true && userDoc(uid).data.departmentId == 'DAMA2';
+    }
+
+    function userHasRole(uid, role) {
+      return isActiveUser(uid) && (role in userDoc(uid).data.roles);
+    }
+
+    function isAdminUser(uid) {
+      return userHasRole(uid, 'ADMIN');
+    }
+
+    function isLeadershipUser(uid) {
+      return isAdminUser(uid) || userHasRole(uid, 'TRUONG_PHONG') || userHasRole(uid, 'PHO_PHONG');
+    }
+
+    // Vietnam Time (UTC+7) helpers for WorkLog date lock
+    function vnTime() {
+      return request.time + duration.time(7, 0, 0, 0);
+    }
+
+    function vnTodayNum() {
+      return vnTime().year() * 10000 + vnTime().month() * 100 + vnTime().day();
+    }
+
+    function hasWorkLogUnlock(uid, workDate) {
+      return exists(/databases/$(database)/documents/workLogUnlocks/$(uid + '_' + workDate));
+    }
+
+    function isWorkLogDateEditable(uid, workDate, workDateNum) {
+      return isAdminUser(uid) || (
+        workDateNum <= vnTodayNum() && (
+          workDateNum == vnTodayNum() ||
+          hasWorkLogUnlock(uid, workDate)
+        )
+      );
+    }
+
+    // --- Validation Blueprints ---
+    function isValidRolesList(roles) {
+      return roles is list &&
+        roles.size() >= 1 &&
+        roles.size() <= 6 &&
+        roles.hasOnly(['ADMIN', 'TRUONG_PHONG', 'PHO_PHONG', 'QUAN_LY_DU_AN', 'TRUONG_NHOM', 'CHUYEN_VIEN']);
+    }
+
+    function isValidUserProfile(data) {
+      return data.keys().hasAll(['uid', 'employeeCode', 'fullName', 'roles', 'isActive', 'departmentId', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['uid', 'username', 'authUid', 'employeeCode', 'fullName', 'title', 'roles', 'groupId', 'managerId', 'isActive', 'departmentId', 'createdAt', 'updatedAt']) &&
+        isValidId(data.uid) &&
+        (!('username' in data) || isValidUsername(data.username)) &&
+        (!('authUid' in data) || (data.authUid is string && data.authUid.size() <= 128)) &&
+        data.employeeCode is string && data.employeeCode.size() >= 1 && data.employeeCode.size() <= 32 &&
+        data.fullName is string && data.fullName.size() >= 1 && data.fullName.size() <= 120 &&
+        (!('title' in data) || (data.title is string && data.title.size() <= 120)) &&
+        isValidRolesList(data.roles) &&
+        (!('groupId' in data) || (data.groupId is string && data.groupId.size() <= 64)) &&
+        (!('managerId' in data) || (data.managerId is string && data.managerId.size() <= 128)) &&
+        data.isActive is bool &&
+        data.departmentId == 'DAMA2' &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidAuthCredential(data) {
+      return data.keys().hasAll(['username', 'userId', 'passwordHash', 'mustChangePassword', 'isActive', 'failedAttempts', 'departmentId', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['username', 'userId', 'passwordHash', 'mustChangePassword', 'isActive', 'failedAttempts', 'lockedUntil', 'departmentId', 'createdAt', 'updatedAt']) &&
+        isValidUsername(data.username) &&
+        isValidId(data.userId) &&
+        data.passwordHash is string && data.passwordHash.size() >= 20 && data.passwordHash.size() <= 256 &&
+        data.mustChangePassword is bool &&
+        data.isActive is bool &&
+        data.failedAttempts is int && data.failedAttempts >= 0 && data.failedAttempts <= 100 &&
+        (!('lockedUntil' in data) || (data.lockedUntil is number && data.lockedUntil >= 0)) &&
+        data.departmentId == 'DAMA2' &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidUserPrivate(data) {
+      return data.keys().hasAll(['uid', 'email', 'updatedAt']) &&
+        data.keys().hasOnly(['uid', 'authUid', 'email', 'phone', 'updatedAt']) &&
+        isValidId(data.uid) &&
+        (!('authUid' in data) || (data.authUid is string && data.authUid.size() <= 128)) &&
+        data.email is string && data.email.size() <= 160 &&
+        (!('phone' in data) || (data.phone is string && data.phone.size() <= 32)) &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidGroup(data) {
+      return data.keys().hasAll(['id', 'code', 'name', 'leaderId', 'memberUids', 'departmentId', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['id', 'code', 'name', 'description', 'leaderId', 'memberUids', 'departmentId', 'createdAt', 'updatedAt']) &&
+        isValidId(data.id) &&
+        data.code is string && data.code.size() >= 1 && data.code.size() <= 32 &&
+        data.name is string && data.name.size() >= 1 && data.name.size() <= 120 &&
+        (!('description' in data) || (data.description is string && data.description.size() <= 500)) &&
+        data.leaderId is string && data.leaderId.size() <= 128 &&
+        data.memberUids is list && data.memberUids.size() <= 50 &&
+        (data.memberUids.size() == 0 || data.memberUids[0] is string) &&
+        data.departmentId == 'DAMA2' &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidProject(data) {
+      return data.keys().hasAll(['id', 'code', 'name', 'status', 'pmId', 'memberIds', 'createdBy', 'departmentId', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['id', 'code', 'name', 'description', 'startDate', 'expectedEndDate', 'status', 'pmId', 'memberIds', 'labels', 'createdBy', 'departmentId', 'createdAt', 'updatedAt']) &&
+        isValidId(data.id) &&
+        data.code is string && data.code.size() >= 2 && data.code.size() <= 32 &&
+        data.name is string && data.name.size() >= 1 && data.name.size() <= 160 &&
+        (!('description' in data) || (data.description is string && data.description.size() <= 2000)) &&
+        (!('startDate' in data) || (data.startDate is string && data.startDate.size() <= 20)) &&
+        (!('expectedEndDate' in data) || (data.expectedEndDate is string && data.expectedEndDate.size() <= 20)) &&
+        data.status in ['CHUAN_BI', 'DANG_THUC_HIEN', 'TAM_DUNG', 'HOAN_THANH', 'DONG'] &&
+        isValidId(data.pmId) &&
+        data.memberIds is list && data.memberIds.size() >= 1 && data.memberIds.size() <= 50 && data.memberIds[0] is string &&
+        (!('labels' in data) || (data.labels is list && data.labels.size() <= 15 && (data.labels.size() == 0 || data.labels[0] is string))) &&
+        isValidId(data.createdBy) &&
+        data.departmentId == 'DAMA2' &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidProjectMember(data) {
+      return data.keys().hasAll(['userId', 'projectRole', 'joinedAt']) &&
+        data.keys().hasOnly(['userId', 'projectRole', 'joinedAt']) &&
+        isValidId(data.userId) &&
+        data.projectRole in ['QUAN_LY_DU_AN', 'THANH_VIEN'] &&
+        data.joinedAt is timestamp;
+    }
+
+    function isValidTask(data) {
+      return data.keys().hasAll([
+          'id', 'code', 'title', 'groupId', 'creatorId', 'assigneeId', 'reviewerId',
+          'priority', 'status', 'submissionStatus', 'reviewResult', 'isLocked',
+          'participantIds', 'departmentId', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'id', 'code', 'title', 'description', 'projectId', 'groupId',
+          'creatorId', 'assigneeId', 'reviewerId', 'parentTaskId', 'priority',
+          'startDate', 'dueDate', 'estimatedHours', 'labels', 'attachments',
+          'status', 'submissionStatus', 'submissionNote', 'reviewResult', 'reviewNote',
+          'isLocked', 'participantIds', 'departmentId', 'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(data.id) &&
+        data.code is string && data.code.size() >= 2 && data.code.size() <= 32 &&
+        data.title is string && data.title.size() >= 1 && data.title.size() <= 200 &&
+        (!('description' in data) || (data.description is string && data.description.size() <= 5000)) &&
+        (!('projectId' in data) || (data.projectId is string && data.projectId.size() <= 64)) &&
+        data.groupId is string && data.groupId.size() <= 64 &&
+        isValidId(data.creatorId) &&
+        isValidId(data.assigneeId) &&
+        isValidId(data.reviewerId) &&
+        (!('parentTaskId' in data) || (data.parentTaskId is string && data.parentTaskId.size() <= 64)) &&
+        data.priority in ['THAP', 'TRUNG_BINH', 'CAO', 'KHAN_CAP'] &&
+        (!('startDate' in data) || (data.startDate is string && data.startDate.size() <= 20)) &&
+        (!('dueDate' in data) || (data.dueDate is string && data.dueDate.size() <= 20)) &&
+        (!('estimatedHours' in data) || (data.estimatedHours is number && data.estimatedHours >= 0 && data.estimatedHours <= 10000)) &&
+        (!('labels' in data) || (data.labels is list && data.labels.size() <= 10 && (data.labels.size() == 0 || data.labels[0] is string))) &&
+        (!('attachments' in data) || (data.attachments is list && data.attachments.size() <= 10 && (data.attachments.size() == 0 || data.attachments[0] is string))) &&
+        data.status in ['MOI', 'DANG_THUC_HIEN', 'CHO_XAC_NHAN', 'CHUA_HOAN_THANH', 'HOAN_THANH', 'TAM_HOAN', 'HUY'] &&
+        data.submissionStatus in ['CHUA_NOP', 'DA_NOP'] &&
+        (!('submissionNote' in data) || (data.submissionNote is string && data.submissionNote.size() <= 1000)) &&
+        data.reviewResult in ['CHO_XAC_NHAN', 'DA_HOAN_THANH', 'CHUA_HOAN_THANH'] &&
+        (!('reviewNote' in data) || (data.reviewNote is string && data.reviewNote.size() <= 1000)) &&
+        data.isLocked is bool &&
+        data.participantIds is list && data.participantIds.size() >= 1 && data.participantIds.size() <= 50 && data.participantIds[0] is string &&
+        data.departmentId == 'DAMA2' &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidSubtask(data) {
+      return data.keys().hasAll(['id', 'title', 'isDone', 'createdBy', 'taskParticipantIds', 'createdAt']) &&
+        data.keys().hasOnly(['id', 'title', 'isDone', 'createdBy', 'taskParticipantIds', 'createdAt']) &&
+        isValidId(data.id) &&
+        data.title is string && data.title.size() >= 1 && data.title.size() <= 200 &&
+        data.isDone is bool &&
+        isValidId(data.createdBy) &&
+        data.taskParticipantIds is list && data.taskParticipantIds.size() >= 1 && data.taskParticipantIds.size() <= 50 && data.taskParticipantIds[0] is string &&
+        data.createdAt is timestamp;
+    }
+
+    function isValidComment(data) {
+      return data.keys().hasAll(['id', 'authorId', 'authorName', 'content', 'taskParticipantIds', 'createdAt']) &&
+        data.keys().hasOnly(['id', 'authorId', 'authorName', 'content', 'mentions', 'taskParticipantIds', 'createdAt']) &&
+        isValidId(data.id) &&
+        isActiveUser(data.authorId) &&
+        data.authorName is string && data.authorName.size() >= 1 && data.authorName.size() <= 120 &&
+        data.content is string && data.content.size() >= 1 && data.content.size() <= 2000 &&
+        (!('mentions' in data) || (data.mentions is list && data.mentions.size() <= 20 && (data.mentions.size() == 0 || data.mentions[0] is string))) &&
+        data.taskParticipantIds is list && data.taskParticipantIds.size() >= 1 && data.taskParticipantIds.size() <= 50 && data.taskParticipantIds[0] is string &&
+        data.createdAt is timestamp;
+    }
+
+    function isValidTaskAuditLog(data) {
+      return data.keys().hasAll(['id', 'actorId', 'actorName', 'action', 'detail', 'taskParticipantIds', 'createdAt']) &&
+        data.keys().hasOnly(['id', 'actorId', 'actorName', 'action', 'detail', 'taskParticipantIds', 'createdAt']) &&
+        isValidId(data.id) &&
+        isActiveUser(data.actorId) &&
+        data.actorName is string && data.actorName.size() >= 1 && data.actorName.size() <= 120 &&
+        data.action is string && data.action.size() >= 1 && data.action.size() <= 80 &&
+        data.detail is string && data.detail.size() >= 1 && data.detail.size() <= 1000 &&
+        data.taskParticipantIds is list && data.taskParticipantIds.size() >= 1 && data.taskParticipantIds.size() <= 50 && data.taskParticipantIds[0] is string &&
+        data.createdAt is timestamp;
+    }
+
+    function isValidWorkLog(data) {
+      return data.keys().hasAll(['id', 'userId', 'taskId', 'workDate', 'workDateNum', 'hours', 'note', 'viewerIds', 'departmentId', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['id', 'userId', 'taskId', 'projectId', 'workDate', 'workDateNum', 'hours', 'progressPercent', 'note', 'viewerIds', 'departmentId', 'createdAt', 'updatedAt']) &&
+        isValidId(data.id) &&
+        isValidId(data.userId) &&
+        isValidId(data.taskId) &&
+        (!('projectId' in data) || (data.projectId is string && data.projectId.size() <= 64)) &&
+        data.workDate is string && data.workDate.size() == 10 && data.workDate.matches('^\\d{4}-\\d{2}-\\d{2}$') &&
+        data.workDateNum is int && data.workDateNum >= 20200101 && data.workDateNum <= 21001231 &&
+        data.hours is number && data.hours > 0 && data.hours <= 24 &&
+        (!('progressPercent' in data) || (data.progressPercent is number && data.progressPercent >= 0 && data.progressPercent <= 100)) &&
+        data.note is string && data.note.size() >= 1 && data.note.size() <= 1000 &&
+        data.viewerIds is list && data.viewerIds.size() >= 1 && data.viewerIds.size() <= 30 && data.viewerIds[0] is string &&
+        data.departmentId == 'DAMA2' &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidWorkLogUnlock(data) {
+      return data.keys().hasAll(['id', 'userId', 'workDate', 'unlockedBy', 'reason', 'departmentId', 'unlockedAt']) &&
+        data.keys().hasOnly(['id', 'userId', 'workDate', 'unlockedBy', 'reason', 'departmentId', 'unlockedAt']) &&
+        isValidId(data.id) &&
+        isValidId(data.userId) &&
+        data.workDate is string && data.workDate.size() == 10 && data.workDate.matches('^\\d{4}-\\d{2}-\\d{2}$') &&
+        data.id == (data.userId + '_' + data.workDate) &&
+        isLeadershipUser(data.unlockedBy) &&
+        data.reason is string && data.reason.size() >= 3 && data.reason.size() <= 500 &&
+        data.departmentId == 'DAMA2' &&
+        data.unlockedAt is timestamp;
+    }
+
+    function isValidSystemConfig(data) {
+      return data.keys().hasAll(['lockHour', 'lockMinute', 'reminderHour', 'reminderMinute', 'timezone', 'defaultLabels', 'updatedAt']) &&
+        data.keys().hasOnly(['lockHour', 'lockMinute', 'reminderHour', 'reminderMinute', 'timezone', 'defaultLabels', 'holidays', 'updatedBy', 'updatedAt']) &&
+        data.lockHour is int && data.lockHour >= 0 && data.lockHour <= 23 &&
+        data.lockMinute is int && data.lockMinute >= 0 && data.lockMinute <= 59 &&
+        data.reminderHour is int && data.reminderHour >= 0 && data.reminderHour <= 23 &&
+        data.reminderMinute is int && data.reminderMinute >= 0 && data.reminderMinute <= 59 &&
+        data.timezone is string && data.timezone.size() <= 40 &&
+        data.defaultLabels is list && data.defaultLabels.size() <= 30 && (data.defaultLabels.size() == 0 || data.defaultLabels[0] is string) &&
+        (!('holidays' in data) || (data.holidays is list && data.holidays.size() <= 50 && (data.holidays.size() == 0 || data.holidays[0] is string))) &&
+        (!('updatedBy' in data) || (data.updatedBy is string && data.updatedBy.size() <= 128)) &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidAuditLog(data) {
+      return data.keys().hasAll(['id', 'actorId', 'actorName', 'action', 'targetType', 'targetId', 'detail', 'viewerIds', 'departmentId', 'createdAt']) &&
+        data.keys().hasOnly(['id', 'actorId', 'actorName', 'action', 'targetType', 'targetId', 'detail', 'viewerIds', 'departmentId', 'createdAt']) &&
+        isValidId(data.id) &&
+        isActiveUser(data.actorId) &&
+        data.actorName is string && data.actorName.size() >= 1 && data.actorName.size() <= 120 &&
+        data.action is string && data.action.size() >= 1 && data.action.size() <= 80 &&
+        data.targetType is string && data.targetType.size() >= 1 && data.targetType.size() <= 40 &&
+        data.targetId is string && data.targetId.size() >= 1 && data.targetId.size() <= 128 &&
+        data.detail is string && data.detail.size() >= 1 && data.detail.size() <= 1000 &&
+        data.viewerIds is list && data.viewerIds.size() >= 1 && data.viewerIds.size() <= 30 && data.viewerIds[0] is string &&
+        data.departmentId == 'DAMA2' &&
+        data.createdAt is timestamp;
+    }
+
+    // --- Collection Rules ---
+
+    // Internal Auth Credentials (PBKDF2 salted hashes, NEVER allow list)
+    match /authCredentials/{username} {
+      allow get: if isValidUsername(username);
+      allow create: if isValidUsername(username) &&
+        isValidAuthCredential(incoming()) &&
+        incoming().username == username &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time && (
+          username == 'mbfs_admin' ||
+          userExists(incoming().userId)
+        );
+      allow update: if isValidUsername(username) &&
+        isValidAuthCredential(incoming()) &&
+        incoming().username == existing().username &&
+        incoming().userId == existing().userId &&
+        incoming().departmentId == existing().departmentId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time && (
+          incoming().diff(existing()).affectedKeys().hasOnly(['passwordHash', 'mustChangePassword', 'failedAttempts', 'lockedUntil', 'isActive', 'updatedAt'])
+        );
+      allow delete: if isValidUsername(username) && username != 'mbfs_admin';
+    }
+
+    // Users (non-PII org directory)
+    match /users/{userId} {
+      allow get: if isValidId(userId) && (resource == null || resource.data.departmentId == 'DAMA2');
+      allow list: if resource.data.departmentId == 'DAMA2';
+
+      allow create: if isValidId(userId) &&
+        isValidUserProfile(incoming()) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isValidId(userId) &&
+        isValidUserProfile(incoming()) &&
+        incoming().uid == existing().uid &&
+        incoming().departmentId == existing().departmentId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time;
+
+      allow delete: if isValidId(userId) && userId != 'usr_mbfs_admin';
+
+      match /private/{docId} {
+        allow get: if isValidId(userId) && isValidId(docId);
+        allow create: if isValidId(userId) && isValidId(docId) && isValidUserPrivate(incoming()) && incoming().updatedAt == request.time;
+        allow update: if isValidId(userId) && isValidId(docId) && isValidUserPrivate(incoming()) && incoming().uid == existing().uid && incoming().updatedAt == request.time;
+        allow delete: if isValidId(userId) && isValidId(docId);
+      }
+    }
+
+    // Work Groups (4 groups)
+    match /groups/{groupId} {
+      allow get: if isValidId(groupId) && (resource == null || resource.data.departmentId == 'DAMA2');
+      allow list: if resource.data.departmentId == 'DAMA2';
+
+      allow create: if isValidId(groupId) && isValidGroup(incoming()) && incoming().createdAt == request.time && incoming().updatedAt == request.time;
+      allow update: if isValidId(groupId) && isValidGroup(incoming()) && incoming().id == existing().id && incoming().departmentId == existing().departmentId && incoming().createdAt == existing().createdAt && incoming().updatedAt == request.time;
+      allow delete: if isValidId(groupId);
+    }
+
+    // Projects
+    match /projects/{projectId} {
+      allow get: if isValidId(projectId) && (resource == null || resource.data.departmentId == 'DAMA2');
+      allow list: if resource.data.departmentId == 'DAMA2';
+
+      allow create: if isValidId(projectId) &&
+        isValidProject(incoming()) &&
+        isActiveUser(incoming().createdBy) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isValidId(projectId) &&
+        isValidProject(incoming()) &&
+        incoming().id == existing().id &&
+        incoming().createdBy == existing().createdBy &&
+        incoming().departmentId == existing().departmentId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time;
+
+      allow delete: if isValidId(projectId);
+
+      match /members/{memberId} {
+        allow get: if isValidId(projectId) && isValidId(memberId);
+        allow list: if isValidId(projectId) && get(/databases/$(database)/documents/projects/$(projectId)).data.departmentId == 'DAMA2';
+        allow create, update: if isValidId(projectId) && isValidId(memberId) && isValidProjectMember(incoming()) && incoming().joinedAt == request.time;
+        allow delete: if isValidId(projectId) && isValidId(memberId);
+      }
+    }
+
+    // Tasks
+    match /tasks/{taskId} {
+      allow get: if isValidId(taskId) && (resource == null || resource.data.departmentId == 'DAMA2');
+      allow list: if resource.data.departmentId == 'DAMA2';
+
+      allow create: if isValidId(taskId) &&
+        isValidTask(incoming()) &&
+        isActiveUser(incoming().creatorId) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        (!('projectId' in incoming()) || incoming().projectId == '' || exists(/databases/$(database)/documents/projects/$(incoming().projectId)));
+
+      allow update: if isValidId(taskId) &&
+        isValidTask(incoming()) &&
+        incoming().id == existing().id &&
+        incoming().code == existing().code &&
+        incoming().creatorId == existing().creatorId &&
+        incoming().departmentId == existing().departmentId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time && (
+          // When unlocked, valid updates are allowed
+          existing().isLocked == false ||
+          // When locked (HOAN_THANH), only reopening with reviewNote >= 3 chars is allowed
+          (
+            existing().isLocked == true &&
+            incoming().isLocked == false &&
+            incoming().status == 'DANG_THUC_HIEN' &&
+            incoming().submissionStatus == 'CHUA_NOP' &&
+            incoming().reviewResult == 'CHUA_HOAN_THANH' &&
+            'reviewNote' in incoming() && incoming().reviewNote.size() >= 3 &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['status', 'submissionStatus', 'reviewResult', 'reviewNote', 'isLocked', 'updatedAt'])
+          )
+        );
+
+      allow delete: if isValidId(taskId);
+
+      match /subtasks/{subtaskId} {
+        allow get: if isValidId(taskId) && isValidId(subtaskId);
+        allow list: if isValidId(taskId) && get(/databases/$(database)/documents/tasks/$(taskId)).data.departmentId == 'DAMA2';
+        allow create, update: if isValidId(taskId) && isValidId(subtaskId) && isValidSubtask(incoming());
+        allow delete: if isValidId(taskId) && isValidId(subtaskId);
+      }
+
+      match /comments/{commentId} {
+        allow get: if isValidId(taskId) && isValidId(commentId);
+        allow list: if isValidId(taskId) && get(/databases/$(database)/documents/tasks/$(taskId)).data.departmentId == 'DAMA2';
+        allow create: if isValidId(taskId) && isValidId(commentId) && isValidComment(incoming()) && incoming().createdAt == request.time;
+        allow delete: if isValidId(taskId) && isValidId(commentId);
+      }
+
+      match /auditLogs/{logId} {
+        allow get: if isValidId(taskId) && isValidId(logId);
+        allow list: if isValidId(taskId) && get(/databases/$(database)/documents/tasks/$(taskId)).data.departmentId == 'DAMA2';
+        allow create: if isValidId(taskId) && isValidId(logId) && isValidTaskAuditLog(incoming()) && incoming().createdAt == request.time;
+        allow delete: if isValidId(taskId) && isValidId(logId);
+      }
+    }
+
+    // WorkLogs (enforces Vietnam UTC+7 date lock on server)
+    match /workLogs/{logId} {
+      allow get: if isValidId(logId) && (resource == null || resource.data.departmentId == 'DAMA2');
+      allow list: if resource.data.departmentId == 'DAMA2';
+
+      allow create: if isValidId(logId) &&
+        isValidWorkLog(incoming()) &&
+        isActiveUser(incoming().userId) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        exists(/databases/$(database)/documents/tasks/$(incoming().taskId)) &&
+        isWorkLogDateEditable(incoming().userId, incoming().workDate, incoming().workDateNum);
+
+      allow update: if isValidId(logId) &&
+        isValidWorkLog(incoming()) &&
+        isActiveUser(existing().userId) &&
+        incoming().id == existing().id &&
+        incoming().userId == existing().userId &&
+        incoming().workDate == existing().workDate &&
+        incoming().workDateNum == existing().workDateNum &&
+        incoming().departmentId == existing().departmentId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        isWorkLogDateEditable(existing().userId, existing().workDate, existing().workDateNum);
+
+      allow delete: if isValidId(logId) && (
+        (isActiveUser(existing().userId) && isWorkLogDateEditable(existing().userId, existing().workDate, existing().workDateNum)) ||
+        !exists(/databases/$(database)/documents/tasks/$(existing().taskId))
+      );
+    }
+
+    // WorkLog Unlocks (Admin or Trưởng/Phó phòng only via isLeadershipUser check)
+    match /workLogUnlocks/{unlockId} {
+      allow get: if isValidId(unlockId) && (resource == null || resource.data.departmentId == 'DAMA2');
+      allow list: if resource.data.departmentId == 'DAMA2';
+      allow create, update: if isValidId(unlockId) &&
+        isValidWorkLogUnlock(incoming()) &&
+        unlockId == incoming().id &&
+        incoming().unlockedAt == request.time;
+      allow delete: if isValidId(unlockId);
+    }
+
+    // System Configs
+    match /systemConfigs/{configId} {
+      allow get: if isValidId(configId);
+      allow create, update: if isValidId(configId) && isValidSystemConfig(incoming()) && incoming().updatedAt == request.time;
+      allow delete: if isValidId(configId);
+    }
+
+    // System Audit Logs
+    match /auditLogs/{logId} {
+      allow get: if isValidId(logId) && (resource == null || resource.data.departmentId == 'DAMA2');
+      allow list: if resource.data.departmentId == 'DAMA2';
+      allow create: if isValidId(logId) && isValidAuditLog(incoming()) && incoming().createdAt == request.time;
+      allow delete: if isValidId(logId);
+    }
+  }
+}

@@ -1,0 +1,343 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Hồ sơ nhân sự nội bộ phòng ban (không chứa PII nhạy cảm)",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "username": { "type": "string", "maxLength": 64, "pattern": "^[a-z0-9._\\-]+$" },
+        "authUid": { "type": "string", "maxLength": 128 },
+        "employeeCode": { "type": "string", "maxLength": 32 },
+        "fullName": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "title": { "type": "string", "maxLength": 120 },
+        "roles": { "type": "array" },
+        "groupId": { "type": "string", "maxLength": 64 },
+        "managerId": { "type": "string", "maxLength": 128 },
+        "isActive": { "type": "boolean" },
+        "departmentId": { "type": "string", "maxLength": 32 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "employeeCode", "fullName", "roles", "isActive", "departmentId", "createdAt", "updatedAt"]
+    },
+    "AuthCredential": {
+      "title": "AuthCredential",
+      "description": "Thông tin xác thực nội bộ (PBKDF2 salted hash) tách biệt khỏi hồ sơ nhân sự",
+      "type": "object",
+      "properties": {
+        "username": { "type": "string", "minLength": 2, "maxLength": 64, "pattern": "^[a-z0-9._\\-]+$" },
+        "userId": { "type": "string", "maxLength": 128 },
+        "passwordHash": { "type": "string", "maxLength": 256 },
+        "mustChangePassword": { "type": "boolean" },
+        "isActive": { "type": "boolean" },
+        "failedAttempts": { "type": "number" },
+        "lockedUntil": { "type": "number" },
+        "departmentId": { "type": "string", "maxLength": 32 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["username", "userId", "passwordHash", "mustChangePassword", "isActive", "failedAttempts", "departmentId", "createdAt", "updatedAt"]
+    },
+    "UserPrivateInfo": {
+      "title": "UserPrivateInfo",
+      "description": "Thông tin riêng tư (PII) của nhân sự tách riêng khỏi hồ sơ công khai",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "maxLength": 128 },
+        "authUid": { "type": "string", "maxLength": 128 },
+        "email": { "type": "string", "format": "email", "maxLength": 160 },
+        "phone": { "type": "string", "maxLength": 32 },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "email", "updatedAt"]
+    },
+    "WorkGroup": {
+      "title": "WorkGroup",
+      "description": "Nhóm việc nghiệp vụ trong phòng ban (tối đa 4 nhóm)",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "code": { "type": "string", "maxLength": 32 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "description": { "type": "string", "maxLength": 500 },
+        "leaderId": { "type": "string", "maxLength": 128 },
+        "departmentId": { "type": "string", "maxLength": 32 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "code", "name", "leaderId", "departmentId", "createdAt", "updatedAt"]
+    },
+    "Project": {
+      "title": "Project",
+      "description": "Dự án hành chính/nghiệp vụ trong phòng ban",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "code": { "type": "string", "minLength": 2, "maxLength": 32 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "description": { "type": "string", "maxLength": 2000 },
+        "startDate": { "type": "string", "maxLength": 20 },
+        "expectedEndDate": { "type": "string", "maxLength": 20 },
+        "status": {
+          "type": "string",
+          "enum": ["CHUAN_BI", "DANG_THUC_HIEN", "TAM_DUNG", "HOAN_THANH", "DONG"]
+        },
+        "pmId": { "type": "string", "maxLength": 128 },
+        "memberIds": { "type": "array" },
+        "labels": { "type": "array" },
+        "createdBy": { "type": "string", "maxLength": 128 },
+        "departmentId": { "type": "string", "maxLength": 32 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "code", "name", "status", "pmId", "memberIds", "createdBy", "departmentId", "createdAt", "updatedAt"]
+    },
+    "ProjectMember": {
+      "title": "ProjectMember",
+      "description": "Thành viên tham gia dự án (Master Gate subcollection)",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "maxLength": 128 },
+        "projectRole": { "type": "string", "enum": ["QUAN_LY_DU_AN", "THANH_VIEN"] },
+        "joinedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "projectRole", "joinedAt"]
+    },
+    "Task": {
+      "title": "Task",
+      "description": "Công việc / nhiệm vụ hành chính nghiệp vụ",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "code": { "type": "string", "minLength": 2, "maxLength": 32 },
+        "title": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "description": { "type": "string", "maxLength": 5000 },
+        "projectId": { "type": "string", "maxLength": 64 },
+        "groupId": { "type": "string", "maxLength": 64 },
+        "creatorId": { "type": "string", "maxLength": 128 },
+        "assigneeId": { "type": "string", "maxLength": 128 },
+        "reviewerId": { "type": "string", "maxLength": 128 },
+        "parentTaskId": { "type": "string", "maxLength": 64 },
+        "priority": { "type": "string", "enum": ["THAP", "TRUNG_BINH", "CAO", "KHAN_CAP"] },
+        "startDate": { "type": "string", "maxLength": 20 },
+        "dueDate": { "type": "string", "maxLength": 20 },
+        "estimatedHours": { "type": "number" },
+        "labels": { "type": "array" },
+        "attachments": { "type": "array" },
+        "status": {
+          "type": "string",
+          "enum": ["MOI", "DANG_THUC_HIEN", "CHO_XAC_NHAN", "CHUA_HOAN_THANH", "HOAN_THANH", "TAM_HOAN", "HUY"]
+        },
+        "submissionStatus": { "type": "string", "enum": ["CHUA_NOP", "DA_NOP"] },
+        "submissionNote": { "type": "string", "maxLength": 1000 },
+        "reviewResult": { "type": "string", "enum": ["CHO_XAC_NHAN", "DA_HOAN_THANH", "CHUA_HOAN_THANH"] },
+        "reviewNote": { "type": "string", "maxLength": 1000 },
+        "isLocked": { "type": "boolean" },
+        "participantIds": { "type": "array" },
+        "departmentId": { "type": "string", "maxLength": 32 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "id", "code", "title", "groupId", "creatorId", "assigneeId", "reviewerId",
+        "priority", "status", "submissionStatus", "reviewResult", "isLocked",
+        "participantIds", "departmentId", "createdAt", "updatedAt"
+      ]
+    },
+    "TaskSubtask": {
+      "title": "TaskSubtask",
+      "description": "Đầu việc con trong một công việc",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 64 },
+        "title": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "isDone": { "type": "boolean" },
+        "createdBy": { "type": "string", "maxLength": 128 },
+        "taskParticipantIds": { "type": "array" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "title", "isDone", "createdBy", "taskParticipantIds", "createdAt"]
+    },
+    "TaskComment": {
+      "title": "TaskComment",
+      "description": "Bình luận và nhắc tên trong công việc",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 64 },
+        "authorId": { "type": "string", "maxLength": 128 },
+        "authorName": { "type": "string", "maxLength": 120 },
+        "content": { "type": "string", "minLength": 1, "maxLength": 2000 },
+        "mentions": { "type": "array" },
+        "taskParticipantIds": { "type": "array" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "authorId", "authorName", "content", "taskParticipantIds", "createdAt"]
+    },
+    "TaskAuditLog": {
+      "title": "TaskAuditLog",
+      "description": "Lịch sử thay đổi trạng thái, nộp kết quả, xác nhận của công việc",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 64 },
+        "actorId": { "type": "string", "maxLength": 128 },
+        "actorName": { "type": "string", "maxLength": 120 },
+        "action": { "type": "string", "maxLength": 80 },
+        "detail": { "type": "string", "maxLength": 1000 },
+        "taskParticipantIds": { "type": "array" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "actorId", "actorName", "action", "detail", "taskParticipantIds", "createdAt"]
+    },
+    "Invite": {
+      "title": "Invite",
+      "description": "Lời mời kích hoạt hồ sơ nhân sự do Admin cấp",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 160 },
+        "email": { "type": "string", "format": "email", "maxLength": 160 },
+        "targetUserId": { "type": "string", "maxLength": 128 },
+        "roles": { "type": "array" },
+        "groupId": { "type": "string", "maxLength": 64 },
+        "managerId": { "type": "string", "maxLength": 128 },
+        "fullName": { "type": "string", "maxLength": 120 },
+        "employeeCode": { "type": "string", "maxLength": 32 },
+        "title": { "type": "string", "maxLength": 120 },
+        "isActive": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "email", "targetUserId", "roles", "fullName", "employeeCode", "isActive", "createdAt"]
+    },
+    "WorkLog": {
+      "title": "WorkLog",
+      "description": "Nhật ký làm việc theo ngày của nhân sự (theo giờ Việt Nam UTC+7)",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "userId": { "type": "string", "maxLength": 128 },
+        "taskId": { "type": "string", "maxLength": 64 },
+        "projectId": { "type": "string", "maxLength": 64 },
+        "workDate": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$", "maxLength": 10 },
+        "workDateNum": { "type": "number" },
+        "hours": { "type": "number" },
+        "progressPercent": { "type": "number" },
+        "note": { "type": "string", "minLength": 1, "maxLength": 1000 },
+        "departmentId": { "type": "string", "maxLength": 32 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "userId", "taskId", "workDate", "workDateNum", "hours", "note", "departmentId", "createdAt", "updatedAt"]
+    },
+    "WorkLogUnlock": {
+      "title": "WorkLogUnlock",
+      "description": "Lịch sử mở khóa ngày log work quá hạn do Admin/Trưởng/Phó phòng cấp",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 160, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "userId": { "type": "string", "maxLength": 128 },
+        "workDate": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$", "maxLength": 10 },
+        "unlockedBy": { "type": "string", "maxLength": 128 },
+        "reason": { "type": "string", "minLength": 3, "maxLength": 500 },
+        "departmentId": { "type": "string", "maxLength": 32 },
+        "unlockedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "userId", "workDate", "unlockedBy", "reason", "departmentId", "unlockedAt"]
+    },
+    "SystemConfig": {
+      "title": "SystemConfig",
+      "description": "Cấu hình phòng ban: giờ khóa ngày, giờ nhắc nhở, nhãn mặc định",
+      "type": "object",
+      "properties": {
+        "lockHour": { "type": "number" },
+        "lockMinute": { "type": "number" },
+        "reminderHour": { "type": "number" },
+        "reminderMinute": { "type": "number" },
+        "timezone": { "type": "string", "maxLength": 40 },
+        "defaultLabels": { "type": "array" },
+        "holidays": { "type": "array" },
+        "updatedBy": { "type": "string", "maxLength": 128 },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["lockHour", "lockMinute", "reminderHour", "reminderMinute", "timezone", "defaultLabels", "updatedAt"]
+    },
+    "AuditLog": {
+      "title": "AuditLog",
+      "description": "Nhật ký hoạt động toàn hệ thống",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 64 },
+        "actorId": { "type": "string", "maxLength": 128 },
+        "actorName": { "type": "string", "maxLength": 120 },
+        "action": { "type": "string", "maxLength": 80 },
+        "targetType": { "type": "string", "maxLength": 40 },
+        "targetId": { "type": "string", "maxLength": 128 },
+        "detail": { "type": "string", "maxLength": 1000 },
+        "departmentId": { "type": "string", "maxLength": 32 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "actorId", "actorName", "action", "targetType", "targetId", "detail", "departmentId", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Hồ sơ nhân sự nội bộ phòng ban"
+    },
+    "/users/{userId}/private/{docId}": {
+      "schema": { "$ref": "#/entities/UserPrivateInfo" },
+      "description": "Thông tin PII tách biệt của nhân sự"
+    },
+    "/groups/{groupId}": {
+      "schema": { "$ref": "#/entities/WorkGroup" },
+      "description": "4 nhóm việc của phòng ban"
+    },
+    "/projects/{projectId}": {
+      "schema": { "$ref": "#/entities/Project" },
+      "description": "Dự án hành chính/nghiệp vụ"
+    },
+    "/projects/{projectId}/members/{userId}": {
+      "schema": { "$ref": "#/entities/ProjectMember" },
+      "description": "Thành viên thuộc dự án"
+    },
+    "/tasks/{taskId}": {
+      "schema": { "$ref": "#/entities/Task" },
+      "description": "Công việc / nhiệm vụ"
+    },
+    "/tasks/{taskId}/subtasks/{subtaskId}": {
+      "schema": { "$ref": "#/entities/TaskSubtask" },
+      "description": "Đầu việc con"
+    },
+    "/tasks/{taskId}/comments/{commentId}": {
+      "schema": { "$ref": "#/entities/TaskComment" },
+      "description": "Bình luận công việc"
+    },
+    "/tasks/{taskId}/auditLogs/{logId}": {
+      "schema": { "$ref": "#/entities/TaskAuditLog" },
+      "description": "Lịch sử thay đổi công việc"
+    },
+    "/workLogs/{logId}": {
+      "schema": { "$ref": "#/entities/WorkLog" },
+      "description": "Nhật ký làm việc theo ngày"
+    },
+    "/workLogUnlocks/{unlockId}": {
+      "schema": { "$ref": "#/entities/WorkLogUnlock" },
+      "description": "Mở khóa log work quá hạn"
+    },
+    "/systemConfigs/{configId}": {
+      "schema": { "$ref": "#/entities/SystemConfig" },
+      "description": "Cấu hình phòng ban"
+    },
+    "/auditLogs/{logId}": {
+      "schema": { "$ref": "#/entities/AuditLog" },
+      "description": "Nhật ký hoạt động hệ thống"
+    },
+    "/invites/{inviteId}": {
+      "schema": { "$ref": "#/entities/Invite" },
+      "description": "Lời mời kích hoạt hồ sơ nhân sự"
+    },
+    "/authCredentials/{username}": {
+      "schema": { "$ref": "#/entities/AuthCredential" },
+      "description": "Thông tin đăng nhập nội bộ tách biệt"
+    }
+  }
+}

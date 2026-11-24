@@ -1,0 +1,6 @@
+{
+  "name": "Quản Trị Công Việc Phòng Ban",
+  "description": "Hệ thống quản lý công việc, dự án, nhật ký làm việc theo ngày và quy trình nộp – xác nhận dành cho phòng ban hành chính nghiệp vụ.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
