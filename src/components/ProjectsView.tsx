@@ -228,7 +228,7 @@ export function ProjectsView({
               </div>
               <div>
                 <label className="block text-xs font-medium text-slate-700 mb-1">
-                  Kết thúc dự kiến
+                  Ngày kết thúc dự kiến
                 </label>
                 <input
                   type="date"
@@ -637,7 +637,7 @@ export function ProjectsView({
                 </div>
 
                 <div className="flex flex-wrap items-center justify-between gap-2 pt-3 border-t border-slate-100 text-xs text-slate-500">
-                  <span>PM: {pm?.fullName || '—'}</span>
+                  <span>Quản lý dự án: {pm?.fullName || '—'}</span>
                   <span className="inline-flex items-center gap-1 tabular-nums">
                     <Users className="w-3.5 h-3.5" />
                     {prj.memberIds.length} thành viên · Hạn {formatDisplayDate(prj.expectedEndDate)}

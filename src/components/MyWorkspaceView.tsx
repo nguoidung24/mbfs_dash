@@ -3,7 +3,13 @@ import { CheckCheck, Clock, Send, ShieldAlert } from 'lucide-react';
 import { Project, TaskItem, UserProfile, WorkGroup } from '../types/domain';
 import { batchApproveTasks } from '../lib/firestoreService';
 import { canReviewTask } from '../lib/rbac';
-import { formatDisplayDate, isTaskOverdue } from '../lib/time';
+import {
+  filterTasksByDateRange,
+  formatDisplayDate,
+  isTaskOverdue,
+  TaskDateFilterMode,
+} from '../lib/time';
+import { DateRangeFilterBar } from './DateRangeFilterBar';
 import { PriorityLabel, TaskStatusLabel } from './StatusText';
 
 interface MyWorkspaceViewProps {
@@ -31,33 +37,44 @@ export function MyWorkspaceView({
   );
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [batching, setBatching] = useState(false);
+  const [fromDate, setFromDate] = useState('');
+  const [toDate, setToDate] = useState('');
+  const [dateMode, setDateMode] = useState<TaskDateFilterMode>('DUE_DATE');
+
+  const dateFilteredTasks = useMemo(
+    () => filterTasksByDateRange(tasks, fromDate, toDate, dateMode),
+    [tasks, fromDate, toDate, dateMode]
+  );
 
   const myTasks = useMemo(
-    () => tasks.filter((t) => t.assigneeId === currentUser.uid && t.status !== 'HUY'),
-    [tasks, currentUser.uid]
+    () =>
+      dateFilteredTasks.filter(
+        (t) => t.assigneeId === currentUser.uid && t.status !== 'HUY'
+      ),
+    [dateFilteredTasks, currentUser.uid]
   );
 
   const assignedByMe = useMemo(
     () =>
-      tasks.filter(
+      dateFilteredTasks.filter(
         (t) => t.creatorId === currentUser.uid && t.assigneeId !== currentUser.uid
       ),
-    [tasks, currentUser.uid]
+    [dateFilteredTasks, currentUser.uid]
   );
 
   const pendingReview = useMemo(
     () =>
-      tasks.filter(
+      dateFilteredTasks.filter(
         (t) =>
           t.status === 'CHO_XAC_NHAN' &&
           canReviewTask(currentUser, t, projects)
       ),
-    [tasks, currentUser, projects]
+    [dateFilteredTasks, currentUser, projects]
   );
 
   const overdueTasks = useMemo(
-    () => tasks.filter((t) => isTaskOverdue(t)),
-    [tasks]
+    () => dateFilteredTasks.filter((t) => isTaskOverdue(t)),
+    [dateFilteredTasks]
   );
 
   const activeList =
@@ -89,7 +106,37 @@ export function MyWorkspaceView({
   }
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-5">
+      {/* Date Range Filter */}
+      <div className="bg-white border border-slate-200 rounded-xl p-4 flex flex-wrap items-center justify-between gap-3">
+        <DateRangeFilterBar
+          fromDate={fromDate}
+          toDate={toDate}
+          dateMode={dateMode}
+          onFromDateChange={(val) => {
+            setFromDate(val);
+            setSelectedIds([]);
+          }}
+          onToDateChange={(val) => {
+            setToDate(val);
+            setSelectedIds([]);
+          }}
+          onDateModeChange={(val) => {
+            setDateMode(val);
+            setSelectedIds([]);
+          }}
+          onReset={() => {
+            setFromDate('');
+            setToDate('');
+            setSelectedIds([]);
+          }}
+        />
+
+        <span className="text-xs text-slate-500 tabular-nums">
+          Phạm vi: {dateFilteredTasks.length} / {tasks.length} công việc
+        </span>
+      </div>
+
       {/* Header summary strip */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
         <div className="bg-white border border-slate-200 rounded-xl p-4">
@@ -98,7 +145,7 @@ export function MyWorkspaceView({
             {myTasks.filter((t) => t.status !== 'HOAN_THANH').length}
           </div>
           <div className="text-xs text-slate-500 mt-1 tabular-nums">
-            Tổng {myTasks.length} nhiệm vụ
+            Tổng {myTasks.length} công việc (trừ đã hủy)
           </div>
         </div>
 
@@ -117,7 +164,7 @@ export function MyWorkspaceView({
           <div className="text-2xl font-semibold text-amber-700 mt-1 tabular-nums">
             {pendingReview.length}
           </div>
-          <div className="text-xs text-slate-500 mt-1">Cần kiểm tra & duyệt</div>
+          <div className="text-xs text-slate-500 mt-1">Cần kiểm tra & xác nhận</div>
         </div>
 
         <div className="bg-white border border-slate-200 rounded-xl p-4">
@@ -203,7 +250,7 @@ export function MyWorkspaceView({
               className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-medium text-white bg-emerald-700 rounded-lg hover:bg-emerald-800 whitespace-nowrap"
             >
               <CheckCheck className="w-3.5 h-3.5" />
-              {batching ? 'Đang duyệt...' : `Duyệt hoàn thành (${selectedIds.length})`}
+              {batching ? 'Đang xử lý...' : `Xác nhận hoàn thành (${selectedIds.length})`}
             </button>
           )}
         </div>

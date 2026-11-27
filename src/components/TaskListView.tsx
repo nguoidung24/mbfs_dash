@@ -10,7 +10,13 @@ import {
   UserProfile,
   WorkGroup,
 } from '../types/domain';
-import { formatDisplayDate, isTaskOverdue } from '../lib/time';
+import {
+  filterTasksByDateRange,
+  formatDisplayDate,
+  isTaskOverdue,
+  TaskDateFilterMode,
+} from '../lib/time';
+import { DateRangeFilterBar } from './DateRangeFilterBar';
 import { PriorityLabel, TaskStatusLabel } from './StatusText';
 
 interface TaskListViewProps {
@@ -37,10 +43,14 @@ export function TaskListView({
   const [status, setStatus] = useState<string>('ALL');
   const [priority, setPriority] = useState<string>('ALL');
   const [onlyOverdue, setOnlyOverdue] = useState(false);
+  const [fromDate, setFromDate] = useState('');
+  const [toDate, setToDate] = useState('');
+  const [dateMode, setDateMode] = useState<TaskDateFilterMode>('DUE_DATE');
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
-    return tasks.filter((t) => {
+    const dateMatched = filterTasksByDateRange(tasks, fromDate, toDate, dateMode);
+    return dateMatched.filter((t) => {
       if (q && !t.title.toLowerCase().includes(q) && !t.code.toLowerCase().includes(q)) {
         return false;
       }
@@ -53,7 +63,19 @@ export function TaskListView({
       if (onlyOverdue && !isTaskOverdue(t)) return false;
       return true;
     });
-  }, [tasks, search, projectId, groupId, assigneeId, status, priority, onlyOverdue]);
+  }, [
+    tasks,
+    search,
+    projectId,
+    groupId,
+    assigneeId,
+    status,
+    priority,
+    onlyOverdue,
+    fromDate,
+    toDate,
+    dateMode,
+  ]);
 
   return (
     <div className="space-y-4">
@@ -90,7 +112,7 @@ export function TaskListView({
             onChange={(e) => setGroupId(e.target.value)}
             className="px-3 py-1.5 text-sm bg-white border border-slate-300 rounded-lg focus:outline-none focus:border-blue-700"
           >
-            <option value="ALL">Tất cả 4 nhóm</option>
+            <option value="ALL">Tất cả nhóm việc</option>
             {groups.map((g) => (
               <option key={g.id} value={g.id}>
                 {g.name}
@@ -116,13 +138,28 @@ export function TaskListView({
             onChange={(e) => setStatus(e.target.value)}
             className="px-3 py-1.5 text-sm bg-white border border-slate-300 rounded-lg focus:outline-none focus:border-blue-700"
           >
-            <option value="ALL">Mọi trạng thái</option>
+            <option value="ALL">Tất cả trạng thái</option>
             {(Object.keys(TASK_STATUS_LABELS) as TaskStatus[]).map((st) => (
               <option key={st} value={st}>
                 {TASK_STATUS_LABELS[st]}
               </option>
             ))}
           </select>
+        </div>
+
+        <div className="pt-2 border-t border-slate-100">
+          <DateRangeFilterBar
+            fromDate={fromDate}
+            toDate={toDate}
+            dateMode={dateMode}
+            onFromDateChange={setFromDate}
+            onToDateChange={setToDate}
+            onDateModeChange={setDateMode}
+            onReset={() => {
+              setFromDate('');
+              setToDate('');
+            }}
+          />
         </div>
 
         <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-slate-100 text-xs">

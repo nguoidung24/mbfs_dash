@@ -8,6 +8,7 @@ import {
   where,
 } from 'firebase/firestore';
 import {
+  BarChart3,
   Building2,
   CalendarClock,
   CheckCircle2,
@@ -56,6 +57,7 @@ import { AdminView } from './components/AdminView';
 import { AuthScreen, FirstLoginPasswordScreen } from './components/AuthScreen';
 import { ChangePasswordModal } from './components/ChangePasswordModal';
 import { CreateTaskModal } from './components/CreateTaskModal';
+import { DashboardView } from './components/DashboardView';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { KanbanBoard } from './components/KanbanBoard';
 import { MyWorkspaceView } from './components/MyWorkspaceView';
@@ -64,9 +66,17 @@ import { TaskDetailDrawer } from './components/TaskDetailDrawer';
 import { TaskListView } from './components/TaskListView';
 import { WorkLogsView } from './components/WorkLogsView';
 
-type NavSection = 'WORKSPACE' | 'KANBAN' | 'LIST' | 'PROJECTS' | 'WORKLOGS' | 'ADMIN';
+type NavSection =
+  | 'DASHBOARD'
+  | 'WORKSPACE'
+  | 'KANBAN'
+  | 'LIST'
+  | 'PROJECTS'
+  | 'WORKLOGS'
+  | 'ADMIN';
 
 const SECTION_TITLES: Record<NavSection, string> = {
+  DASHBOARD: 'Tổng quan (Dashboard)',
   WORKSPACE: 'Không gian của tôi',
   KANBAN: 'Bảng công việc',
   LIST: 'Danh sách công việc',
@@ -89,7 +99,7 @@ function AppContent() {
   const [config, setConfig] = useState<SystemConfig | null>(null);
   const [auditLogs, setAuditLogs] = useState<SystemAuditLog[]>([]);
 
-  const [activeNav, setActiveNav] = useState<NavSection>('WORKSPACE');
+  const [activeNav, setActiveNav] = useState<NavSection>('DASHBOARD');
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [userMenuOpen, setUserMenuOpen] = useState(false);
 
@@ -144,7 +154,7 @@ function AppContent() {
     setSyncSuspended(false);
     setCurrentUser(res.user);
     setMustChangePassword(res.mustChangePassword);
-    setActiveNav('WORKSPACE');
+    setActiveNav('DASHBOARD');
   }
 
   function resetLoadedCollections() {
@@ -360,6 +370,7 @@ function AppContent() {
     icon: typeof LayoutDashboard;
     visible: boolean;
   }> = [
+    { id: 'DASHBOARD', label: 'Dashboard', icon: BarChart3, visible: true },
     { id: 'WORKSPACE', label: 'Không gian của tôi', icon: LayoutDashboard, visible: true },
     { id: 'KANBAN', label: 'Bảng công việc', icon: Kanban, visible: true },
     { id: 'LIST', label: 'Danh sách công việc', icon: ListTodo, visible: true },
@@ -548,6 +559,23 @@ function AppContent() {
 
         {/* Main Viewport */}
         <main className="flex-1 p-4 sm:p-6 max-w-[1440px] w-full mx-auto">
+          {activeNav === 'DASHBOARD' && (
+            <DashboardView
+              tasks={visibleTasks}
+              projects={visibleProjects}
+              users={users}
+              groups={groups}
+              workLogs={visibleWorkLogs}
+              onSelectTask={(t) => setSelectedTaskId(t.id)}
+              onNavigateList={() => setActiveNav('LIST')}
+              onCreateTask={() => {
+                setEditingTask(null);
+                setCreateTaskProjectId('');
+                setCreateTaskOpen(true);
+              }}
+            />
+          )}
+
           {activeNav === 'WORKSPACE' && (
             <MyWorkspaceView
               currentUser={currentUser}

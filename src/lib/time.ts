@@ -174,3 +174,118 @@ export function getCurrentWeekDates(referenceDateStr?: string): string[] {
   }
   return res;
 }
+
+export function getDateStrFromTimestamp(ts: unknown): string {
+  if (!ts) return '';
+  let date: Date | null = null;
+  if (
+    typeof ts === 'object' &&
+    ts !== null &&
+    'toDate' in ts &&
+    typeof (ts as { toDate: () => Date }).toDate === 'function'
+  ) {
+    date = (ts as { toDate: () => Date }).toDate();
+  } else if (ts instanceof Date) {
+    date = ts;
+  } else if (typeof ts === 'string' || typeof ts === 'number') {
+    date = new Date(ts);
+  }
+  if (!date || Number.isNaN(date.getTime())) return '';
+  const fmt = new Intl.DateTimeFormat('en-CA', {
+    timeZone: VN_TZ,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  });
+  return fmt.format(date);
+}
+
+export type TaskDateFilterMode = 'DUE_DATE' | 'OVERLAP' | 'START_DATE' | 'CREATED_AT';
+
+export const TASK_DATE_MODE_LABELS: Record<TaskDateFilterMode, string> = {
+  DUE_DATE: 'Theo hạn hoàn thành',
+  OVERLAP: 'Trong khoảng thực hiện',
+  START_DATE: 'Theo ngày bắt đầu',
+  CREATED_AT: 'Theo ngày tạo',
+};
+
+export function shiftDateStr(dateStr: string, deltaDays: number): string {
+  const d = new Date(`${dateStr}T12:00:00`);
+  d.setDate(d.getDate() + deltaDays);
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+export function getDateRangePresets(): {
+  today: { from: string; to: string };
+  thisWeek: { from: string; to: string };
+  thisMonth: { from: string; to: string };
+  last30Days: { from: string; to: string };
+} {
+  const { dateStr: today } = getVietnamNowParts();
+  const weekDates = getCurrentWeekDates(today);
+  const [yearStr, monthStr] = today.split('-');
+  const monthStart = `${yearStr}-${monthStr}-01`;
+  const lastDay = new Date(Number(yearStr), Number(monthStr), 0).getDate();
+  const monthEnd = `${yearStr}-${monthStr}-${String(lastDay).padStart(2, '0')}`;
+
+  return {
+    today: { from: today, to: today },
+    thisWeek: { from: weekDates[0], to: weekDates[6] },
+    thisMonth: { from: monthStart, to: monthEnd },
+    last30Days: { from: shiftDateStr(today, -29), to: today },
+  };
+}
+
+export function filterTasksByDateRange(
+  tasks: TaskItem[],
+  fromDate: string,
+  toDate: string,
+  mode: TaskDateFilterMode = 'DUE_DATE'
+): TaskItem[] {
+  const rawFrom = fromDate.trim();
+  const rawTo = toDate.trim();
+  if (!rawFrom && !rawTo) return tasks;
+
+  const hasBoth = Boolean(rawFrom && rawTo);
+  const from = hasBoth && rawFrom > rawTo ? rawTo : rawFrom;
+  const to = hasBoth && rawFrom > rawTo ? rawFrom : rawTo;
+
+  return tasks.filter((task) => {
+    if (mode === 'DUE_DATE') {
+      const target = task.dueDate || '';
+      if (!target) return false;
+      if (from && target < from) return false;
+      if (to && target > to) return false;
+      return true;
+    }
+
+    if (mode === 'START_DATE') {
+      const target = task.startDate || '';
+      if (!target) return false;
+      if (from && target < from) return false;
+      if (to && target > to) return false;
+      return true;
+    }
+
+    if (mode === 'CREATED_AT') {
+      const target = getDateStrFromTimestamp(task.createdAt);
+      if (!target) return false;
+      if (from && target < from) return false;
+      if (to && target > to) return false;
+      return true;
+    }
+
+    // OVERLAP: task interval [start, end] overlaps [from, to]
+    const createdStr = getDateStrFromTimestamp(task.createdAt);
+    const start = task.startDate || task.dueDate || createdStr;
+    const end = task.dueDate || task.startDate || createdStr;
+    if (!start && !end) return false;
+    if (from && end < from) return false;
+    if (to && start > to) return false;
+    return true;
+  });
+}
+

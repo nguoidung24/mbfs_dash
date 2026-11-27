@@ -10,6 +10,7 @@ import {
 } from 'firebase/auth';
 import {
   collection,
+  deleteDoc,
   doc,
   getDoc,
   getDocFromServer,
@@ -1994,4 +1995,171 @@ export async function signInGoogleForDbAdmin(): Promise<GoogleDbAdminUser> {
 export async function signOutGoogleForDbAdmin(): Promise<void> {
   await logoutSession();
 }
+
+export async function deduplicateDuplicateUsersBySuperAdmin(params: {
+  username: string;
+  duplicateUsers: UserProfile[];
+  actor: UserProfile;
+  allUsers: UserProfile[];
+}): Promise<{ survivor: UserProfile; removedCount: number }> {
+  const { username, duplicateUsers, actor, allUsers } = params;
+  if (duplicateUsers.length < 2) {
+    throw new Error('Không có bản ghi trùng lặp để xử lý.');
+  }
+
+  const spaceId = getActiveSpaceId();
+  const defaultAdminUid = getDefaultAdminUid();
+  const spaceKey = await getOrInitSpaceAesKey(spaceId);
+
+  // Keep canonical usr_mbfs_admin when present (required by firestore.rules),
+  // otherwise keep current actor or first user with authUid.
+  const survivorBase =
+    duplicateUsers.find((u) => u.uid === defaultAdminUid) ||
+    duplicateUsers.find((u) => u.uid === actor.uid) ||
+    duplicateUsers.find((u) => Boolean(u.authUid)) ||
+    duplicateUsers[0];
+
+  const duplicates = duplicateUsers.filter((u) => u.uid !== survivorBase.uid);
+  const richerSource =
+    duplicateUsers.find((u) => u.uid === actor.uid) ||
+    duplicateUsers.find((u) => u.uid !== survivorBase.uid && (u.roles.length > survivorBase.roles.length || Boolean(u.groupId))) ||
+    survivorBase;
+
+  const mergedRoles = Array.from(
+    new Set<RoleCode>([...survivorBase.roles, ...duplicateUsers.flatMap((u) => u.roles)])
+  );
+  const resolvedAuthUid =
+    survivorBase.authUid || duplicateUsers.find((u) => Boolean(u.authUid))?.authUid || '';
+  const mergedGroupId = survivorBase.groupId || richerSource.groupId || '';
+  const mergedManagerIdRaw = survivorBase.managerId || richerSource.managerId || '';
+  const mergedManagerId = duplicates.some((d) => d.uid === mergedManagerIdRaw)
+    ? survivorBase.uid
+    : mergedManagerIdRaw;
+  const mergedEmail =
+    survivorBase.email ||
+    duplicateUsers.find((u) => Boolean(u.email))?.email ||
+    (await fetchUserEmailForAdmin(richerSource.uid)) ||
+    '';
+
+  const payload: EncryptedAccountPayload = {
+    username: normalizeUsername(survivorBase.username || username),
+    employeeCode: survivorBase.employeeCode || richerSource.employeeCode || 'AD-01',
+    fullName: survivorBase.fullName || richerSource.fullName || 'Nhân sự',
+    title: survivorBase.title || richerSource.title || '',
+    email: mergedEmail,
+  };
+  const encryptedAccount = await encryptAccountData(spaceKey, payload);
+
+  try {
+    const survivorRef = doc(db, 'users', survivorBase.uid);
+    const survivorSnap = await getDocFromServer(survivorRef);
+    const survivorRaw = survivorSnap.exists()
+      ? (survivorSnap.data() as Record<string, unknown>)
+      : null;
+
+    await setDoc(survivorRef, {
+      uid: survivorBase.uid,
+      authUid: resolvedAuthUid,
+      encryptedAccount,
+      mustChangePassword: Boolean(survivorRaw?.mustChangePassword),
+      roles: mergedRoles,
+      groupId: mergedGroupId,
+      managerId: mergedManagerId,
+      isActive: true,
+      departmentId: spaceId,
+      createdAt: survivorRaw?.createdAt || serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+
+    if (resolvedAuthUid) {
+      const bindingRef = doc(db, 'authBindings', resolvedAuthUid);
+      const bindingSnap = await getDocFromServer(bindingRef);
+      if (bindingSnap.exists()) {
+        const bData = bindingSnap.data() as AuthBinding;
+        if (bData.userId !== survivorBase.uid) {
+          await deleteDoc(bindingRef);
+          await setDoc(bindingRef, {
+            authUid: resolvedAuthUid,
+            userId: survivorBase.uid,
+            departmentId: spaceId,
+            isActive: true,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+        }
+      } else {
+        await setDoc(bindingRef, {
+          authUid: resolvedAuthUid,
+          userId: survivorBase.uid,
+          departmentId: spaceId,
+          isActive: true,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      }
+    }
+
+    if (mergedEmail) {
+      const encryptedPrivate = await encryptPrivateData(spaceKey, { email: mergedEmail });
+      await setDoc(doc(db, 'users', survivorBase.uid, 'private', 'info'), {
+        uid: survivorBase.uid,
+        encryptedPrivate,
+        updatedAt: serverTimestamp(),
+      });
+    }
+
+    let removedCount = 0;
+    for (const dup of duplicates) {
+      if (dup.authUid && dup.authUid !== resolvedAuthUid) {
+        const dupBindingRef = doc(db, 'authBindings', dup.authUid);
+        const dupBindingSnap = await getDocFromServer(dupBindingRef);
+        if (dupBindingSnap.exists() && dupBindingSnap.data()?.userId === dup.uid) {
+          await deleteDoc(dupBindingRef);
+        }
+      }
+      const privRef = doc(db, 'users', dup.uid, 'private', 'info');
+      const privSnap = await getDocFromServer(privRef);
+      if (privSnap.exists()) {
+        await deleteDoc(privRef);
+      }
+      await deleteDoc(doc(db, 'users', dup.uid));
+      removedCount += 1;
+    }
+
+    const survivor: UserProfile = {
+      ...survivorBase,
+      authUid: resolvedAuthUid,
+      encryptedAccount,
+      username: payload.username,
+      employeeCode: payload.employeeCode,
+      fullName: payload.fullName,
+      title: payload.title,
+      email: payload.email,
+      roles: mergedRoles,
+      groupId: mergedGroupId,
+      managerId: mergedManagerId,
+      isActive: true,
+      departmentId: spaceId,
+    };
+
+    const nextAllUsers = [
+      survivor,
+      ...allUsers.filter((u) => !duplicateUsers.some((d) => d.uid === u.uid)),
+    ];
+
+    await logSystemAudit({
+      actor: survivor,
+      action: 'Gộp tài khoản trùng lặp',
+      targetType: 'user',
+      targetId: survivor.uid,
+      detail: `Đã gộp & xóa ${removedCount} bản ghi trùng của tài khoản @${payload.username} (giữ lại ID chuẩn ${survivor.uid})`,
+      allUsers: nextAllUsers,
+    });
+
+    return { survivor, removedCount };
+  } catch (error) {
+    handleFirestoreError(error, OperationType.DELETE, `users/deduplicate/${username}`);
+  }
+}
+
 

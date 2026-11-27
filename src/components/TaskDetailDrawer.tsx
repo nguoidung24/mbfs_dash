@@ -344,7 +344,7 @@ export function TaskDetailDrawer({
           <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-4">
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
               <div>
-                <div className="text-slate-500">Lớp 1 · Trạng thái nộp</div>
+                <div className="text-slate-500">Bước 1 · Trạng thái nộp kết quả</div>
                 <div className="font-semibold text-slate-900 mt-0.5">
                   {SUBMISSION_STATUS_LABELS[task.submissionStatus]}
                 </div>
@@ -353,7 +353,7 @@ export function TaskDetailDrawer({
                 )}
               </div>
               <div>
-                <div className="text-slate-500">Lớp 2 · Kết quả xác nhận</div>
+                <div className="text-slate-500">Bước 2 · Kết quả xác nhận</div>
                 <div className="font-semibold text-slate-900 mt-0.5">
                   {REVIEW_RESULT_LABELS[task.reviewResult]}
                 </div>
@@ -412,7 +412,7 @@ export function TaskDetailDrawer({
                     className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-red-700 bg-white border border-red-200 rounded-lg hover:bg-red-50 whitespace-nowrap"
                   >
                     <XCircle className="w-3.5 h-3.5" />
-                    Chưa hoàn thành
+                    Trả lại (Chưa hoàn thành)
                   </button>
                 </>
               )}
@@ -436,7 +436,7 @@ export function TaskDetailDrawer({
                   onClick={handleCancelTask}
                   className="px-3 py-1.5 text-xs font-medium text-slate-600 hover:text-red-700 whitespace-nowrap ml-auto"
                 >
-                  Hủy việc
+                  Hủy công việc
                 </button>
               )}
             </div>
@@ -566,7 +566,7 @@ export function TaskDetailDrawer({
                   </div>
                 </div>
                 <div>
-                  <div className="text-slate-500">Ngày bắt đầu · Hạn</div>
+                  <div className="text-slate-500">Ngày bắt đầu · Hạn hoàn thành</div>
                   <div className="font-medium text-slate-900 mt-0.5 tabular-nums">
                     {formatDisplayDate(task.startDate)} → {formatDisplayDate(task.dueDate)}
                   </div>

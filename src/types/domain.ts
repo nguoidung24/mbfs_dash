@@ -218,8 +218,8 @@ export const PROJECT_STATUS_LABELS: Record<ProjectStatus, string> = {
   CHUAN_BI: 'Chuẩn bị',
   DANG_THUC_HIEN: 'Đang thực hiện',
   TAM_DUNG: 'Tạm dừng',
-  HOAN_THANH: 'Hoàn thành',
-  DONG: 'Đóng',
+  HOAN_THANH: 'Đã hoàn thành',
+  DONG: 'Đã đóng',
 };
 
 export const PRIORITY_LABELS: Record<TaskPriority, string> = {
@@ -236,11 +236,11 @@ export const TASK_STATUS_LABELS: Record<TaskStatus, string> = {
   CHUA_HOAN_THANH: 'Chưa hoàn thành',
   HOAN_THANH: 'Đã hoàn thành',
   TAM_HOAN: 'Tạm hoãn',
-  HUY: 'Hủy',
+  HUY: 'Đã hủy',
 };
 
 export const SUBMISSION_STATUS_LABELS: Record<SubmissionStatus, string> = {
-  CHUA_NOP: 'Chưa nộp',
+  CHUA_NOP: 'Chưa nộp kết quả',
   DA_NOP: 'Đã nộp kết quả',
 };
 

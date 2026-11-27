@@ -194,7 +194,7 @@ export function CreateTaskModal({
             <p className="text-xs text-slate-500 mt-0.5">
               {editingTask
                 ? 'Cập nhật nội dung, thời hạn và phân công thực hiện'
-                : 'Giao việc cho cấp dưới hoặc tự tạo nhiệm vụ cho bản thân'}
+                : 'Giao việc cho cấp dưới hoặc tự tạo công việc cho bản thân'}
             </p>
           </div>
           <button

@@ -1,5 +1,5 @@
-import React, { useState } from 'react';
-import { AlertCircle, Lock } from 'lucide-react';
+import React, { useMemo, useState } from 'react';
+import { AlertCircle, Lock, Search } from 'lucide-react';
 import {
   KANBAN_COLUMNS,
   Project,
@@ -10,7 +10,13 @@ import {
 } from '../types/domain';
 import { reviewTaskDecision, updateTaskProgressOrSubmit } from '../lib/firestoreService';
 import { canReviewTask } from '../lib/rbac';
-import { formatDisplayDate, isTaskOverdue } from '../lib/time';
+import {
+  filterTasksByDateRange,
+  formatDisplayDate,
+  isTaskOverdue,
+  TaskDateFilterMode,
+} from '../lib/time';
+import { DateRangeFilterBar } from './DateRangeFilterBar';
 import { PriorityLabel } from './StatusText';
 
 interface KanbanBoardProps {
@@ -40,6 +46,23 @@ export function KanbanBoard({
     targetStatus: TaskStatus;
   } | null>(null);
   const [transitionNote, setTransitionNote] = useState('');
+  const [search, setSearch] = useState('');
+  const [assigneeId, setAssigneeId] = useState('ALL');
+  const [fromDate, setFromDate] = useState('');
+  const [toDate, setToDate] = useState('');
+  const [dateMode, setDateMode] = useState<TaskDateFilterMode>('DUE_DATE');
+
+  const filteredTasks = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    const byDate = filterTasksByDateRange(tasks, fromDate, toDate, dateMode);
+    return byDate.filter((t) => {
+      if (q && !t.title.toLowerCase().includes(q) && !t.code.toLowerCase().includes(q)) {
+        return false;
+      }
+      if (assigneeId !== 'ALL' && t.assigneeId !== assigneeId) return false;
+      return true;
+    });
+  }, [tasks, search, assigneeId, fromDate, toDate, dateMode]);
 
   async function attemptMove(task: TaskItem, targetStatus: TaskStatus) {
     setErrorBanner('');
@@ -120,7 +143,7 @@ export function KanbanBoard({
         decision: 'REJECT',
         note: transitionNote.trim(),
       });
-      onNotify(`Đã trả lại ${task.code} để thực hiện bổ sung.`);
+      onNotify(`Đã trả lại ${task.code} (Chưa hoàn thành).`);
     } else if (targetStatus === 'CHO_XAC_NHAN') {
       await updateTaskProgressOrSubmit({
         task,
@@ -152,9 +175,59 @@ export function KanbanBoard({
         </div>
       )}
 
+      <div className="bg-white border border-slate-200 rounded-xl p-4 space-y-3">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex flex-wrap items-center gap-3 flex-1 min-w-[240px]">
+            <div className="relative flex-1 min-w-[200px] max-w-xs">
+              <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+              <input
+                type="text"
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder="Tìm mã hoặc tiêu đề..."
+                className="w-full pl-9 pr-3 py-1.5 text-xs bg-white border border-slate-300 rounded-lg focus:outline-none focus:border-blue-700"
+              />
+            </div>
+
+            <select
+              aria-label="Lọc theo người thực hiện"
+              value={assigneeId}
+              onChange={(e) => setAssigneeId(e.target.value)}
+              className="px-2.5 py-1.5 text-xs bg-white border border-slate-300 rounded-lg focus:outline-none focus:border-blue-700"
+            >
+              <option value="ALL">Tất cả nhân sự</option>
+              {users.map((u) => (
+                <option key={u.uid} value={u.uid}>
+                  {u.fullName}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <span className="text-xs text-slate-500 tabular-nums">
+            Hiển thị {filteredTasks.length} / {tasks.length} công việc
+          </span>
+        </div>
+
+        <div className="pt-2 border-t border-slate-100">
+          <DateRangeFilterBar
+            fromDate={fromDate}
+            toDate={toDate}
+            dateMode={dateMode}
+            onFromDateChange={setFromDate}
+            onToDateChange={setToDate}
+            onDateModeChange={setDateMode}
+            onReset={() => {
+              setFromDate('');
+              setToDate('');
+            }}
+          />
+        </div>
+      </div>
+
       <div className="flex gap-4 overflow-x-auto pb-4 items-start">
         {KANBAN_COLUMNS.map((colStatus) => {
-          const colTasks = tasks.filter((t) => t.status === colStatus);
+          const colTasks = filteredTasks.filter((t) => t.status === colStatus);
           const isDragOver = dragOverCol === colStatus;
 
           return (
@@ -284,7 +357,7 @@ export function KanbanBoard({
             <h3 className="text-sm font-semibold text-slate-900">
               {pendingTransition.targetStatus === 'CHO_XAC_NHAN'
                 ? `Nộp kết quả công việc ${pendingTransition.task.code}`
-                : `Yêu cầu làm lại ${pendingTransition.task.code}`}
+                : `Trả lại công việc ${pendingTransition.task.code} (Chưa hoàn thành)`}
             </h3>
             <form onSubmit={submitTransitionPrompt} className="space-y-3">
               <textarea

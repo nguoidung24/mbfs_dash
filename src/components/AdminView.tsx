@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { onAuthStateChanged } from 'firebase/auth';
 import {
   AlertTriangle,
@@ -42,6 +42,7 @@ import {
 import {
   activateLegacyUserAuthByAdmin,
   createGroupByAdmin,
+  deduplicateDuplicateUsersBySuperAdmin,
   fetchUserEmailForAdmin,
   GoogleDbAdminUser,
   saveGroupByAdmin,
@@ -170,6 +171,61 @@ export function AdminView({
 
   const isDbAdminUnlocked =
     Boolean(dbAuthUser) && dbAuthUser?.email === DAMA2_SUPER_ADMIN_EMAIL;
+
+  const [dedupingUsername, setDedupingUsername] = useState<string | null>(null);
+  const [dedupeError, setDedupeError] = useState('');
+
+  const duplicateUsernameGroups = useMemo(() => {
+    const grouped = new Map<string, UserProfile[]>();
+    for (const u of users) {
+      const uname = (u.username || '').trim().toLowerCase();
+      if (!uname) continue;
+      const list = grouped.get(uname) || [];
+      list.push(u);
+      grouped.set(uname, list);
+    }
+    return Array.from(grouped.entries())
+      .filter(([, list]) => list.length > 1)
+      .map(([username, list]) => ({ username, list }));
+  }, [users]);
+
+  const duplicatedUidSet = useMemo(() => {
+    const set = new Set<string>();
+    for (const grp of duplicateUsernameGroups) {
+      for (const u of grp.list) set.add(u.uid);
+    }
+    return set;
+  }, [duplicateUsernameGroups]);
+
+  async function handleDeduplicateUsername(username: string, list: UserProfile[]) {
+    setDedupeError('');
+    if (!isDbAdminUnlocked) {
+      onNotify(
+        'Vui lòng mở khóa quyền Quản trị CSDL bằng Gmail quản trị ở tab "Sao lưu & Dữ liệu" trước khi gộp & xóa tài khoản trùng.'
+      );
+      setTab('DATA');
+      return;
+    }
+    setDedupingUsername(username);
+    try {
+      const res = await deduplicateDuplicateUsersBySuperAdmin({
+        username,
+        duplicateUsers: list,
+        actor: currentUser,
+        allUsers: users,
+      });
+      if (list.some((u) => u.uid === currentUser.uid)) {
+        onCurrentUserUpdated?.(res.survivor);
+      }
+      onNotify(`Đã gộp và xóa ${res.removedCount} bản ghi trùng của tài khoản @${username}.`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Không thể gộp tài khoản trùng.';
+      setDedupeError(msg);
+      onNotify(msg);
+    } finally {
+      setDedupingUsername(null);
+    }
+  }
 
   function openCreateUser() {
     setEditingUser(null);
@@ -551,37 +607,100 @@ export function AdminView({
       </div>
 
       {tab === 'USERS' && (
-        <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
-          <div className="overflow-x-auto">
-            <table className="w-full text-left border-collapse">
-              <thead>
-                <tr className="border-b border-slate-200 bg-slate-50 text-xs font-medium text-slate-500">
-                  <th className="py-2.5 px-4">Mã NV</th>
-                  <th className="py-2.5 px-4">Tài khoản</th>
-                  <th className="py-2.5 px-4">Họ và tên</th>
-                  <th className="py-2.5 px-4">Nhóm</th>
-                  <th className="py-2.5 px-4">Vai trò RBAC</th>
-                  <th className="py-2.5 px-4">Cấp trên trực tiếp</th>
-                  <th className="py-2.5 px-4">Trạng thái</th>
-                  {isAdmin && <th className="py-2.5 px-4 text-right">Thao tác</th>}
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-100 text-sm">
-                {users.map((u) => {
-                  const grp = groups.find((g) => g.id === u.groupId);
-                  const mgr = users.find((m) => m.uid === u.managerId);
-                  return (
-                    <tr key={u.uid} className="hover:bg-slate-50">
-                      <td className="py-2.5 px-4 font-mono text-xs text-slate-600 whitespace-nowrap">
-                        {u.employeeCode}
-                      </td>
-                      <td className="py-2.5 px-4 font-mono text-xs text-slate-700 whitespace-nowrap">
-                        {u.username ? `@${u.username}` : <span className="text-slate-400">—</span>}
-                      </td>
-                      <td className="py-2.5 px-4">
-                        <div className="font-medium text-slate-900">{u.fullName}</div>
-                        <div className="text-xs text-slate-500">{u.title || '—'}</div>
-                      </td>
+        <div className="space-y-4">
+          {isAdmin && duplicateUsernameGroups.length > 0 && (
+            <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 space-y-3">
+              <div className="flex items-start gap-2.5">
+                <AlertTriangle className="w-4 h-4 text-amber-700 mt-0.5 shrink-0" />
+                <div className="space-y-1 text-xs text-amber-900">
+                  <div className="font-semibold text-sm">
+                    Phát hiện tài khoản trùng tên đăng nhập trong cơ sở dữ liệu
+                  </div>
+                  <p className="text-amber-800 leading-relaxed">
+                    Nguyên nhân thường gặp là do hồ sơ cũ hoặc bản khôi phục Excel dùng mã tài liệu
+                    (Document ID) khác với bản ghi chuẩn <span className="font-mono">usr_mbfs_admin</span>,
+                    khiến cùng một <span className="font-mono">@username</span> tồn tại 2 bản ghi độc lập.
+                  </p>
+                </div>
+              </div>
+
+              {dedupeError && (
+                <div className="text-xs text-red-700 bg-red-50 border border-red-200 rounded-lg px-3 py-2">
+                  {dedupeError}
+                </div>
+              )}
+
+              <div className="space-y-2">
+                {duplicateUsernameGroups.map(({ username, list }) => (
+                  <div
+                    key={username}
+                    className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-white border border-amber-200 rounded-lg px-3.5 py-2.5"
+                  >
+                    <div className="space-y-0.5">
+                      <div className="text-xs font-semibold text-slate-900">
+                        <span className="font-mono">@{username}</span> ·{' '}
+                        <span className="tabular-nums">{list.length}</span> bản ghi trùng
+                      </div>
+                      <div className="text-[11px] text-slate-600 font-mono break-all">
+                        ID: {list.map((item) => item.uid).join(' · ')}
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      disabled={dedupingUsername === username}
+                      onClick={() => handleDeduplicateUsername(username, list)}
+                      className="inline-flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-amber-700 rounded-lg hover:bg-amber-800 disabled:opacity-60 whitespace-nowrap"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                      {dedupingUsername === username
+                        ? 'Đang gộp...'
+                        : isDbAdminUnlocked
+                        ? 'Gộp & xóa bản trùng'
+                        : 'Mở khóa Gmail để gộp bản trùng'}
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
+            <div className="overflow-x-auto">
+              <table className="w-full text-left border-collapse">
+                <thead>
+                  <tr className="border-b border-slate-200 bg-slate-50 text-xs font-medium text-slate-500">
+                    <th className="py-2.5 px-4">Mã NV</th>
+                    <th className="py-2.5 px-4">Tài khoản</th>
+                    <th className="py-2.5 px-4">Họ và tên</th>
+                    <th className="py-2.5 px-4">Nhóm</th>
+                    <th className="py-2.5 px-4">Vai trò RBAC</th>
+                    <th className="py-2.5 px-4">Cấp trên trực tiếp</th>
+                    <th className="py-2.5 px-4">Trạng thái</th>
+                    {isAdmin && <th className="py-2.5 px-4 text-right">Thao tác</th>}
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100 text-sm">
+                  {users.map((u) => {
+                    const grp = groups.find((g) => g.id === u.groupId);
+                    const mgr = users.find((m) => m.uid === u.managerId);
+                    const isDup = duplicatedUidSet.has(u.uid);
+                    return (
+                      <tr key={u.uid} className="hover:bg-slate-50">
+                        <td className="py-2.5 px-4 font-mono text-xs text-slate-600 whitespace-nowrap">
+                          {u.employeeCode}
+                        </td>
+                        <td className="py-2.5 px-4 font-mono text-xs text-slate-700 whitespace-nowrap">
+                          <div>
+                            {u.username ? `@${u.username}` : <span className="text-slate-400">—</span>}
+                          </div>
+                          {isDup && (
+                            <div className="text-[11px] text-amber-700">ID: {u.uid}</div>
+                          )}
+                        </td>
+                        <td className="py-2.5 px-4">
+                          <div className="font-medium text-slate-900">{u.fullName}</div>
+                          <div className="text-xs text-slate-500">{u.title || '—'}</div>
+                        </td>
                       <td className="py-2.5 px-4 text-xs text-slate-700 whitespace-nowrap">
                         {grp?.name || '—'}
                       </td>
@@ -654,6 +773,7 @@ export function AdminView({
                 })}
               </tbody>
             </table>
+          </div>
           </div>
         </div>
       )}
@@ -729,7 +849,7 @@ export function AdminView({
           <div className="grid grid-cols-2 gap-4">
             <div>
               <label className="block text-xs font-medium text-slate-700 mb-1">
-                Giờ khóa log work
+                Giờ khóa nhật ký ngày
               </label>
               <div className="flex items-center gap-2">
                 <input
@@ -1480,7 +1600,7 @@ export function AdminView({
             </div>
 
             <p className="text-xs text-slate-600 leading-relaxed">
-              Toàn bộ dự án, công việc, log work, nhóm việc, cấu hình và tài khoản nhân sự khác sẽ bị xóa vĩnh viễn. Chỉ duy nhất tài khoản Quản trị hệ thống (<strong className="font-mono">@{currentUser.username}</strong>) được giữ lại.
+              Toàn bộ dự án, công việc, nhật ký làm việc, nhóm việc, cấu hình và tài khoản nhân sự khác sẽ bị xóa vĩnh viễn. Chỉ duy nhất tài khoản Quản trị hệ thống (<strong className="font-mono">@{currentUser.username}</strong>) được giữ lại.
             </p>
 
             <form onSubmit={handleWipeAllData} className="space-y-3">

@@ -570,6 +570,23 @@ export async function importDatabaseFromExcel(
   const existingUsersMap = new Map(
     existingUsersSnap.docs.map((d) => [d.id, d.data() as Record<string, unknown>])
   );
+  const decodedExistingUsers = await decodeUserProfiles(
+    existingUsersSnap.docs.map((d) => d.data() as Record<string, unknown>),
+    spaceId
+  );
+  const existingUidByUsername = new Map<string, string>();
+  for (const eu of decodedExistingUsers) {
+    const uname = normalizeUsername(eu.username || '');
+    if (uname && !existingUidByUsername.has(uname)) {
+      existingUidByUsername.set(uname, eu.uid);
+    }
+  }
+  const uidRemap = new Map<string, string>();
+  const resolveImportedUserId = (raw: string): string => {
+    const scoped = scopeIdForSpace(raw, 'usr', spaceId);
+    return uidRemap.get(scoped) || scoped;
+  };
+
   const existingGroupIds = new Set(existingGroupsSnap.docs.map((d) => d.id));
   const existingProjectsMap = new Map(existingProjectsSnap.docs.map((d) => [d.id, d.data() as Project]));
   const existingTasksMap = new Map(existingTasksSnap.docs.map((d) => [d.id, d.data() as TaskItem]));
@@ -596,9 +613,23 @@ export async function importDatabaseFromExcel(
   for (const row of userRows) {
     const rawUid = str(row.uid, 128);
     if (!rawUid) continue;
-    const uid = scopeIdForSpace(rawUid, 'usr', spaceId);
     const rawUsername = normalizeUsername(str(row.username, 64));
     const username = rawUsername && isValidUsernameFormat(rawUsername) ? rawUsername : '';
+    const scopedRawUid = scopeIdForSpace(rawUid, 'usr', spaceId);
+    let uid = scopedRawUid;
+    if (!existingUsersMap.has(uid) && username) {
+      const matchedExistingUid = existingUidByUsername.get(username);
+      if (matchedExistingUid) {
+        uid = matchedExistingUid;
+      }
+    }
+    if (uid !== scopedRawUid) {
+      uidRemap.set(scopedRawUid, uid);
+    }
+    if (username && !existingUidByUsername.has(username)) {
+      existingUidByUsername.set(username, uid);
+    }
+
     const employeeCode = str(row.employeeCode, 32) || uid.slice(0, 12);
     const fullName = str(row.fullName, 120) || employeeCode;
     const title = str(row.title, 120);
@@ -615,7 +646,7 @@ export async function importDatabaseFromExcel(
     const rawGroupId = str(row.groupId, 64);
     const groupId = rawGroupId ? scopeIdForSpace(rawGroupId, 'grp', spaceId) : '';
     const rawManagerId = str(row.managerId, 128);
-    const managerId = rawManagerId ? scopeIdForSpace(rawManagerId, 'usr', spaceId) : '';
+    const managerId = rawManagerId ? resolveImportedUserId(rawManagerId) : '';
     const email = str(row.email, 160).toLowerCase();
     const initialPassword = str(row.initialPassword, 128);
 
@@ -771,10 +802,10 @@ export async function importDatabaseFromExcel(
     const name = str(row.name, 120) || code;
     const description = str(row.description, 500);
     const rawLeader = str(row.leaderId, 128);
-    const leaderId = rawLeader ? scopeIdForSpace(rawLeader, 'usr', spaceId) : '';
+    const leaderId = rawLeader ? resolveImportedUserId(rawLeader) : '';
     const memberUids = splitList(row.memberUids)
       .slice(0, 50)
-      .map((u) => scopeIdForSpace(u, 'usr', spaceId));
+      .map((u) => resolveImportedUserId(u));
 
     const payload = {
       id,
@@ -819,13 +850,13 @@ export async function importDatabaseFromExcel(
       ? rawStatus
       : 'DANG_THUC_HIEN';
     const rawPm = str(row.pmId, 128);
-    const pmId = rawPm ? scopeIdForSpace(rawPm, 'usr', spaceId) : actor.uid;
+    const pmId = rawPm ? resolveImportedUserId(rawPm) : actor.uid;
     const memberIds = Array.from(
-      new Set([pmId, ...splitList(row.memberIds).map((u) => scopeIdForSpace(u, 'usr', spaceId))])
+      new Set([pmId, ...splitList(row.memberIds).map((u) => resolveImportedUserId(u))])
     ).slice(0, 50);
     const labels = splitList(row.labels).slice(0, 15);
     const rawCreator = str(row.createdBy, 128);
-    const mappedCreator = rawCreator ? scopeIdForSpace(rawCreator, 'usr', spaceId) : actor.uid;
+    const mappedCreator = rawCreator ? resolveImportedUserId(rawCreator) : actor.uid;
     const createdBy = activeUserIds.has(mappedCreator) ? mappedCreator : actor.uid;
 
     const existing = existingProjectsMap.get(id);
@@ -906,12 +937,12 @@ export async function importDatabaseFromExcel(
     const groupId = rawGroupId ? scopeIdForSpace(rawGroupId, 'grp', spaceId) : '';
 
     const rawCreator = str(row.creatorId, 128);
-    const mappedCreator = rawCreator ? scopeIdForSpace(rawCreator, 'usr', spaceId) : actor.uid;
+    const mappedCreator = rawCreator ? resolveImportedUserId(rawCreator) : actor.uid;
     const creatorId = activeUserIds.has(mappedCreator) ? mappedCreator : actor.uid;
     const rawAssignee = str(row.assigneeId, 128);
-    const assigneeId = rawAssignee ? scopeIdForSpace(rawAssignee, 'usr', spaceId) : creatorId;
+    const assigneeId = rawAssignee ? resolveImportedUserId(rawAssignee) : creatorId;
     const rawReviewer = str(row.reviewerId, 128);
-    const reviewerId = rawReviewer ? scopeIdForSpace(rawReviewer, 'usr', spaceId) : creatorId;
+    const reviewerId = rawReviewer ? resolveImportedUserId(rawReviewer) : creatorId;
     const rawParentTask = str(row.parentTaskId, 64);
     const parentTaskId = rawParentTask ? scopeIdForSpace(rawParentTask, 'tsk', spaceId) : '';
 
@@ -944,7 +975,7 @@ export async function importDatabaseFromExcel(
         assigneeId,
         reviewerId,
         actor.uid,
-        ...splitList(row.participantIds).map((u) => scopeIdForSpace(u, 'usr', spaceId)),
+        ...splitList(row.participantIds).map((u) => resolveImportedUserId(u)),
       ])
     ).slice(0, 50);
 
@@ -1025,12 +1056,12 @@ export async function importDatabaseFromExcel(
     if (!title) continue;
     const isDone = parseBool(row.isDone, false);
     const rawCreatedBy = str(row.createdBy, 128);
-    const createdBy = rawCreatedBy ? scopeIdForSpace(rawCreatedBy, 'usr', spaceId) : actor.uid;
+    const createdBy = rawCreatedBy ? resolveImportedUserId(rawCreatedBy) : actor.uid;
     const taskParticipantIds = Array.from(
       new Set([
         actor.uid,
         createdBy,
-        ...splitList(row.taskParticipantIds).map((u) => scopeIdForSpace(u, 'usr', spaceId)),
+        ...splitList(row.taskParticipantIds).map((u) => resolveImportedUserId(u)),
       ])
     ).slice(0, 50);
 
@@ -1059,17 +1090,17 @@ export async function importDatabaseFromExcel(
     const content = str(row.content, 2000);
     if (!content) continue;
     const rawAuthor = str(row.authorId, 128);
-    const mappedAuthor = rawAuthor ? scopeIdForSpace(rawAuthor, 'usr', spaceId) : actor.uid;
+    const mappedAuthor = rawAuthor ? resolveImportedUserId(rawAuthor) : actor.uid;
     const authorId = activeUserIds.has(mappedAuthor) ? mappedAuthor : actor.uid;
     const authorName = str(row.authorName, 120) || actor.fullName;
     const mentions = splitList(row.mentions)
       .slice(0, 20)
-      .map((u) => scopeIdForSpace(u, 'usr', spaceId));
+      .map((u) => resolveImportedUserId(u));
     const taskParticipantIds = Array.from(
       new Set([
         actor.uid,
         authorId,
-        ...splitList(row.taskParticipantIds).map((u) => scopeIdForSpace(u, 'usr', spaceId)),
+        ...splitList(row.taskParticipantIds).map((u) => resolveImportedUserId(u)),
       ])
     ).slice(0, 50);
 
@@ -1099,13 +1130,13 @@ export async function importDatabaseFromExcel(
   const coveredUnlockKeys = new Set<string>(existingUlIds);
 
   for (const row of unlockRows) {
-    const userId = scopeIdForSpace(str(row.userId, 128), 'usr', spaceId);
+    const userId = resolveImportedUserId(str(row.userId, 128));
     const workDate = str(row.workDate, 10);
     if (!/^\d{4}-\d{2}-\d{2}$/.test(workDate)) continue;
     const id = `${userId}_${workDate}`.slice(0, 128);
     const rawUnlockedBy = str(row.unlockedBy, 128);
     const mappedUnlockedBy = rawUnlockedBy
-      ? scopeIdForSpace(rawUnlockedBy, 'usr', spaceId)
+      ? resolveImportedUserId(rawUnlockedBy)
       : actor.uid;
     const unlockedBy = activeUserIds.has(mappedUnlockedBy) ? mappedUnlockedBy : actor.uid;
     const reason = str(row.reason, 500);
@@ -1127,7 +1158,7 @@ export async function importDatabaseFromExcel(
 
   for (const row of workLogRows) {
     const rawUser = str(row.userId, 128);
-    const mappedUser = rawUser ? scopeIdForSpace(rawUser, 'usr', spaceId) : actor.uid;
+    const mappedUser = rawUser ? resolveImportedUserId(rawUser) : actor.uid;
     const userId = activeUserIds.has(mappedUser) ? mappedUser : actor.uid;
     const workDate = str(row.workDate, 10);
     if (!/^\d{4}-\d{2}-\d{2}$/.test(workDate)) continue;
@@ -1159,7 +1190,7 @@ export async function importDatabaseFromExcel(
     const taskId = scopeIdForSpace(str(row.taskId, 128), 'tsk', spaceId);
     if (!validTaskIds.has(taskId)) continue;
     const rawUser = str(row.userId, 128);
-    const mappedUser = rawUser ? scopeIdForSpace(rawUser, 'usr', spaceId) : actor.uid;
+    const mappedUser = rawUser ? resolveImportedUserId(rawUser) : actor.uid;
     const userId = activeUserIds.has(mappedUser) ? mappedUser : actor.uid;
     const workDate = str(row.workDate, 10);
     if (!/^\d{4}-\d{2}-\d{2}$/.test(workDate)) continue;
@@ -1175,7 +1206,7 @@ export async function importDatabaseFromExcel(
       new Set([
         userId,
         actor.uid,
-        ...splitList(row.viewerIds).map((u) => scopeIdForSpace(u, 'usr', spaceId)),
+        ...splitList(row.viewerIds).map((u) => resolveImportedUserId(u)),
       ])
     ).slice(0, 30);
 
