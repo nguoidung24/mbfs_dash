@@ -32,6 +32,8 @@ export interface UserProfile {
   uid: string;
   username?: string;
   authUid?: string;
+  encryptedAccount?: string;
+  mustChangePassword?: boolean;
   employeeCode: string;
   fullName: string;
   title?: string;
@@ -45,15 +47,19 @@ export interface UserProfile {
   updatedAt?: unknown;
 }
 
-export interface AuthCredential {
+export interface EncryptedAccountPayload {
   username: string;
+  employeeCode: string;
+  fullName: string;
+  title: string;
+  email: string;
+}
+
+export interface AuthBinding {
+  authUid: string;
   userId: string;
-  passwordHash: string;
-  mustChangePassword: boolean;
-  isActive: boolean;
-  failedAttempts: number;
-  lockedUntil?: number;
   departmentId: string;
+  isActive: boolean;
   createdAt?: unknown;
   updatedAt?: unknown;
 }

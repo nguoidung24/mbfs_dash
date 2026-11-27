@@ -1,7 +1,18 @@
 import {
+  createUserWithEmailAndPassword,
+  deleteUser,
+  EmailAuthProvider,
+  reauthenticateWithCredential,
+  signInWithEmailAndPassword,
+  signInWithPopup,
+  signOut,
+  updatePassword,
+} from 'firebase/auth';
+import {
   collection,
   doc,
   getDoc,
+  getDocFromServer,
   getDocs,
   query,
   serverTimestamp,
@@ -12,9 +23,9 @@ import {
   WriteBatch,
 } from 'firebase/firestore';
 import {
-  AuthCredential,
+  AuthBinding,
   DEFAULT_ADMIN_USERNAME,
-  DEPARTMENT_ID,
+  EncryptedAccountPayload,
   Project,
   ProjectStatus,
   RoleCode,
@@ -29,19 +40,36 @@ import {
 } from '../types/domain';
 import {
   DEFAULT_ADMIN_BOOTSTRAP_HASH,
-  hashPassword,
+  decryptJsonPayload,
+  encryptJsonPayload,
+  generateSpaceAesKeyBase64,
+  importSpaceAesKey,
   validatePasswordStrength,
   verifyPassword,
 } from './cryptoAuth';
-import { db, handleFirestoreError, OperationType } from './firebase';
+import {
+  auth,
+  db,
+  getActiveSpaceId,
+  getDefaultAdminUid,
+  getInternalAuthEmail,
+  getSystemConfigDocId,
+  googleProvider,
+  handleFirestoreError,
+  isInternalAuthEmail,
+  OperationType,
+  provisionerAuth,
+} from './firebase';
 import { buildParticipantIds } from './rbac';
 import { dateStrToNum, getVietnamNowParts } from './time';
 
 const SESSION_STORAGE_KEY = 'dama2_session';
+const spaceKeyCache = new Map<string, CryptoKey>();
 
 export interface StoredSession {
   userId: string;
   username: string;
+  spaceId?: string;
 }
 
 export function normalizeUsername(raw: string): string {
@@ -61,12 +89,147 @@ export function makeId(prefix: string): string {
   return `${prefix}_${Date.now().toString(36)}_${rand}`;
 }
 
-export function saveSession(session: StoredSession): void {
-  sessionStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(session));
+export function clearSpaceKeyCache(spaceId?: string): void {
+  if (spaceId) {
+    spaceKeyCache.delete(spaceId);
+  } else {
+    spaceKeyCache.clear();
+  }
 }
 
-export function logoutSession(): void {
+export async function getSpaceAesKey(
+  spaceId: string = getActiveSpaceId()
+): Promise<CryptoKey | null> {
+  const cached = spaceKeyCache.get(spaceId);
+  if (cached) return cached;
+  try {
+    const snap = await getDocFromServer(doc(db, 'spaceKeys', spaceId));
+    if (!snap.exists()) return null;
+    const data = snap.data() as { keyBase64?: string };
+    if (!data.keyBase64) return null;
+    const key = await importSpaceAesKey(data.keyBase64);
+    spaceKeyCache.set(spaceId, key);
+    return key;
+  } catch {
+    return null;
+  }
+}
+
+export async function getOrInitSpaceAesKey(
+  spaceId: string = getActiveSpaceId()
+): Promise<CryptoKey> {
+  const existing = await getSpaceAesKey(spaceId);
+  if (existing) return existing;
+
+  const keyBase64 = await generateSpaceAesKeyBase64();
+  await setDoc(doc(db, 'spaceKeys', spaceId), {
+    spaceId,
+    keyBase64,
+    alg: 'AES-256-GCM',
+    createdAt: serverTimestamp(),
+  });
+  const key = await importSpaceAesKey(keyBase64);
+  spaceKeyCache.set(spaceId, key);
+  return key;
+}
+
+export async function encryptAccountData(
+  key: CryptoKey,
+  payload: EncryptedAccountPayload
+): Promise<string> {
+  return encryptJsonPayload(key, payload);
+}
+
+export async function encryptPrivateData(
+  key: CryptoKey,
+  pii: { email: string }
+): Promise<string> {
+  return encryptJsonPayload(key, pii);
+}
+
+export async function decryptPrivateEmail(
+  raw: Record<string, unknown>,
+  spaceKey: CryptoKey | null
+): Promise<string> {
+  if (typeof raw.encryptedPrivate === 'string' && spaceKey) {
+    const dec = await decryptJsonPayload<{ email?: string }>(
+      spaceKey,
+      raw.encryptedPrivate
+    );
+    if (dec && typeof dec.email === 'string') {
+      return dec.email;
+    }
+  }
+  return typeof raw.email === 'string' ? raw.email : '';
+}
+
+export async function decodeUserProfileDoc(
+  raw: Record<string, unknown>,
+  spaceKey: CryptoKey | null
+): Promise<UserProfile> {
+  let payload: EncryptedAccountPayload | null = null;
+  if (typeof raw.encryptedAccount === 'string' && spaceKey) {
+    payload = await decryptJsonPayload<EncryptedAccountPayload>(
+      spaceKey,
+      raw.encryptedAccount
+    );
+  }
+  const uid = String(raw.uid || '');
+  return {
+    uid,
+    authUid: typeof raw.authUid === 'string' ? raw.authUid : undefined,
+    encryptedAccount:
+      typeof raw.encryptedAccount === 'string' ? raw.encryptedAccount : undefined,
+    mustChangePassword:
+      typeof raw.mustChangePassword === 'boolean' ? raw.mustChangePassword : false,
+    username: payload?.username || (typeof raw.username === 'string' ? raw.username : ''),
+    employeeCode:
+      payload?.employeeCode ||
+      (typeof raw.employeeCode === 'string' ? raw.employeeCode : uid.slice(0, 10)),
+    fullName:
+      payload?.fullName ||
+      (typeof raw.fullName === 'string' ? raw.fullName : 'Nhân sự'),
+    title: payload?.title ?? (typeof raw.title === 'string' ? raw.title : ''),
+    email: payload?.email ?? (typeof raw.email === 'string' ? raw.email : ''),
+    roles: Array.isArray(raw.roles) ? (raw.roles as RoleCode[]) : ['CHUYEN_VIEN'],
+    groupId: typeof raw.groupId === 'string' ? raw.groupId : '',
+    managerId: typeof raw.managerId === 'string' ? raw.managerId : '',
+    isActive: typeof raw.isActive === 'boolean' ? raw.isActive : true,
+    departmentId:
+      typeof raw.departmentId === 'string' ? raw.departmentId : getActiveSpaceId(),
+    createdAt: raw.createdAt,
+    updatedAt: raw.updatedAt,
+  };
+}
+
+export async function decodeUserProfiles(
+  rawList: Array<Record<string, unknown>>,
+  spaceId: string = getActiveSpaceId()
+): Promise<UserProfile[]> {
+  const spaceKey = await getSpaceAesKey(spaceId);
+  return Promise.all(rawList.map((r) => decodeUserProfileDoc(r, spaceKey)));
+}
+
+export function saveSession(session: StoredSession): void {
+  sessionStorage.setItem(
+    SESSION_STORAGE_KEY,
+    JSON.stringify({
+      ...session,
+      spaceId: session.spaceId || getActiveSpaceId(),
+    })
+  );
+}
+
+export async function logoutSession(): Promise<void> {
+  clearSpaceKeyCache();
   sessionStorage.removeItem(SESSION_STORAGE_KEY);
+  try {
+    if (auth.currentUser) {
+      await signOut(auth);
+    }
+  } catch {
+    // ignore signOut errors
+  }
 }
 
 export async function runBatchOps(
@@ -88,42 +251,70 @@ export async function restoreCurrentSession(): Promise<{
   mustChangePassword: boolean;
 } | null> {
   try {
-    const raw = sessionStorage.getItem(SESSION_STORAGE_KEY);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw) as Partial<StoredSession>;
-    const username = normalizeUsername(parsed.username || '');
-    const userId = (parsed.userId || '').trim();
-    if (!username || !userId || !isValidUsernameFormat(username)) {
-      logoutSession();
+    await auth.authStateReady();
+    const firebaseUser = auth.currentUser;
+    if (!firebaseUser) {
+      sessionStorage.removeItem(SESSION_STORAGE_KEY);
       return null;
     }
 
-    const [credSnap, userSnap] = await Promise.all([
-      getDoc(doc(db, 'authCredentials', username)),
-      getDoc(doc(db, 'users', userId)),
+    if (!isInternalAuthEmail(firebaseUser.email)) {
+      await signOut(auth);
+      sessionStorage.removeItem(SESSION_STORAGE_KEY);
+      return null;
+    }
+
+    const spaceId = getActiveSpaceId();
+    const bindingSnap = await getDocFromServer(doc(db, 'authBindings', firebaseUser.uid));
+    if (!bindingSnap.exists()) {
+      await logoutSession();
+      return null;
+    }
+
+    const binding = bindingSnap.data() as AuthBinding;
+    if (!binding.isActive || binding.departmentId !== spaceId) {
+      await logoutSession();
+      return null;
+    }
+
+    const [userSnap, spaceKey] = await Promise.all([
+      getDocFromServer(doc(db, 'users', binding.userId)),
+      getSpaceAesKey(spaceId),
     ]);
 
-    if (!credSnap.exists() || !userSnap.exists()) {
-      logoutSession();
+    if (!userSnap.exists()) {
+      await logoutSession();
       return null;
     }
 
-    const cred = credSnap.data() as AuthCredential;
-    const user = userSnap.data() as UserProfile;
-
-    if (!cred.isActive || !user.isActive || cred.userId !== user.uid) {
-      logoutSession();
+    const rawUser = userSnap.data() as Record<string, unknown>;
+    if (!rawUser.isActive) {
+      await logoutSession();
       return null;
     }
+
+    const user = await decodeUserProfileDoc(rawUser, spaceKey);
+    saveSession({
+      userId: user.uid,
+      username: user.username || '',
+      spaceId,
+    });
 
     return {
-      user: { ...user, username },
-      mustChangePassword: Boolean(cred.mustChangePassword),
+      user,
+      mustChangePassword: Boolean(rawUser.mustChangePassword),
     };
   } catch {
-    logoutSession();
+    await logoutSession();
     return null;
   }
+}
+
+function getAuthErrorCode(err: unknown): string {
+  if (err && typeof err === 'object' && 'code' in err) {
+    return String((err as { code?: unknown }).code || '');
+  }
+  return '';
 }
 
 export async function loginWithUsernamePassword(
@@ -138,156 +329,262 @@ export async function loginWithUsernamePassword(
     throw new Error('Tên đăng nhập hoặc mật khẩu không hợp lệ.');
   }
 
-  const credRef = doc(db, 'authCredentials', username);
-  let credSnap;
+  const spaceId = getActiveSpaceId();
+  const internalEmail = getInternalAuthEmail(username);
+
+  let signedInViaBootstrap = false;
   try {
-    credSnap = await getDoc(credRef);
-  } catch (error) {
-    handleFirestoreError(error, OperationType.GET, `authCredentials/${username}`);
+    await signInWithEmailAndPassword(auth, internalEmail, password);
+  } catch (err) {
+    const code = getAuthErrorCode(err);
+    if (code === 'auth/operation-not-allowed') {
+      throw new Error(
+        'Phương thức Email/Password chưa được bật trong Firebase Authentication. Vui lòng bật Email/Password tại Firebase Console → Authentication → Sign-in method.'
+      );
+    }
+    if (code === 'auth/too-many-requests') {
+      throw new Error(
+        'Bạn đã nhập sai mật khẩu quá nhiều lần. Firebase Authentication tạm khóa đăng nhập trong ít phút.'
+      );
+    }
+    if (code === 'auth/user-disabled') {
+      throw new Error('Tài khoản xác thực đã bị vô hiệu hóa.');
+    }
+
+    if (
+      (code === 'auth/user-not-found' ||
+        code === 'auth/invalid-credential' ||
+        code === 'auth/wrong-password') &&
+      username === DEFAULT_ADMIN_USERNAME
+    ) {
+      const matchesBootstrap = await verifyPassword(
+        password,
+        DEFAULT_ADMIN_BOOTSTRAP_HASH
+      );
+      if (!matchesBootstrap) {
+        throw new Error('Tên đăng nhập hoặc mật khẩu không đúng.');
+      }
+
+      try {
+        await createUserWithEmailAndPassword(auth, internalEmail, password);
+        signedInViaBootstrap = true;
+      } catch (createErr) {
+        const createCode = getAuthErrorCode(createErr);
+        if (createCode === 'auth/operation-not-allowed') {
+          throw new Error(
+            'Phương thức Email/Password chưa được bật trong Firebase Authentication. Vui lòng bật Email/Password tại Firebase Console → Authentication → Sign-in method.'
+          );
+        }
+        if (createCode === 'auth/email-already-in-use') {
+          throw new Error('Tên đăng nhập hoặc mật khẩu không đúng.');
+        }
+        throw createErr;
+      }
+    } else {
+      throw new Error('Tên đăng nhập hoặc mật khẩu không đúng.');
+    }
   }
 
-  // Bootstrap default admin mbfs_admin on first login (ADMIN role only, NOT Trưởng phòng)
-  if (!credSnap.exists()) {
-    if (username !== DEFAULT_ADMIN_USERNAME) {
-      throw new Error('Tên đăng nhập hoặc mật khẩu không đúng.');
-    }
+  const firebaseUser = auth.currentUser;
+  if (!firebaseUser) {
+    throw new Error('Không thể khởi tạo phiên xác thực Firebase.');
+  }
 
-    const matchesBootstrap = await verifyPassword(
-      password,
-      DEFAULT_ADMIN_BOOTSTRAP_HASH
-    );
-    if (!matchesBootstrap) {
-      throw new Error('Tên đăng nhập hoặc mật khẩu không đúng.');
-    }
+  const authUid = firebaseUser.uid;
+  const adminUid = getDefaultAdminUid();
+  const cfgId = getSystemConfigDocId();
 
-    const adminUid = 'usr_mbfs_admin';
-    const userRef = doc(db, 'users', adminUid);
-    const existingAdminUser = await getDoc(userRef);
-
-    const adminProfile: UserProfile = existingAdminUser.exists()
-      ? ({ ...(existingAdminUser.data() as UserProfile), username } as UserProfile)
-      : {
-          uid: adminUid,
-          username,
-          employeeCode: 'AD-01',
-          fullName: 'Quản trị hệ thống',
-          title: 'Quản trị hệ thống',
-          roles: ['ADMIN'],
-          groupId: '',
-          managerId: '',
-          isActive: true,
-          departmentId: DEPARTMENT_ID,
-        };
-
+  if (signedInViaBootstrap) {
     try {
-      if (!existingAdminUser.exists()) {
-        await setDoc(userRef, {
-          ...adminProfile,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
-      } else if (existingAdminUser.data()?.username !== username) {
-        await updateDoc(userRef, {
-          username,
+      const userRef = doc(db, 'users', adminUid);
+      const existingAdminSnap = await getDocFromServer(userRef);
+      const spaceKey = await getOrInitSpaceAesKey(spaceId);
+
+      const existingRaw = existingAdminSnap.exists()
+        ? (existingAdminSnap.data() as Record<string, unknown>)
+        : null;
+
+      const payload: EncryptedAccountPayload = {
+        username: DEFAULT_ADMIN_USERNAME,
+        employeeCode:
+          existingRaw && typeof existingRaw.employeeCode === 'string' && existingRaw.employeeCode
+            ? existingRaw.employeeCode
+            : 'AD-01',
+        fullName:
+          existingRaw && typeof existingRaw.fullName === 'string' && existingRaw.fullName
+            ? existingRaw.fullName
+            : 'Quản trị hệ thống',
+        title:
+          existingRaw && typeof existingRaw.title === 'string' && existingRaw.title
+            ? existingRaw.title
+            : 'Quản trị hệ thống',
+        email: existingRaw && typeof existingRaw.email === 'string' ? existingRaw.email : '',
+      };
+      const encryptedAccount = await encryptAccountData(spaceKey, payload);
+      const roles: RoleCode[] =
+        existingRaw && Array.isArray(existingRaw.roles) && existingRaw.roles.length > 0
+          ? (existingRaw.roles as RoleCode[])
+          : ['ADMIN'];
+      const groupId =
+        existingRaw && typeof existingRaw.groupId === 'string' ? existingRaw.groupId : '';
+      const managerId =
+        existingRaw && typeof existingRaw.managerId === 'string' ? existingRaw.managerId : '';
+
+      await setDoc(userRef, {
+        uid: adminUid,
+        authUid,
+        encryptedAccount,
+        mustChangePassword: true,
+        roles,
+        groupId,
+        managerId,
+        isActive: true,
+        departmentId: spaceId,
+        createdAt: existingRaw?.createdAt || serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+
+      await setDoc(doc(db, 'authBindings', authUid), {
+        authUid,
+        userId: adminUid,
+        departmentId: spaceId,
+        isActive: true,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+
+      const cfgRef = doc(db, 'systemConfigs', cfgId);
+      const cfgSnap = await getDocFromServer(cfgRef);
+      if (!cfgSnap.exists()) {
+        await setDoc(cfgRef, {
+          lockHour: 23,
+          lockMinute: 59,
+          reminderHour: 17,
+          reminderMinute: 30,
+          timezone: 'Asia/Ho_Chi_Minh',
+          defaultLabels: [
+            'Hành chính',
+            'Báo cáo định kỳ',
+            'Văn bản trình ký',
+            'Kiểm tra nội bộ',
+            'Khẩn',
+          ],
+          holidays: [],
+          departmentId: spaceId,
+          updatedBy: adminUid,
           updatedAt: serverTimestamp(),
         });
       }
 
-      await setDoc(credRef, {
-        username,
-        userId: adminUid,
-        passwordHash: DEFAULT_ADMIN_BOOTSTRAP_HASH,
+      const adminProfile: UserProfile = {
+        uid: adminUid,
+        authUid,
+        encryptedAccount,
         mustChangePassword: true,
+        username: payload.username,
+        employeeCode: payload.employeeCode,
+        fullName: payload.fullName,
+        title: payload.title,
+        email: payload.email,
+        roles,
+        groupId,
+        managerId,
         isActive: true,
-        failedAttempts: 0,
-        lockedUntil: 0,
-        departmentId: DEPARTMENT_ID,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      });
+        departmentId: spaceId,
+      };
+      saveSession({ userId: adminUid, username: payload.username, spaceId });
+      return {
+        user: adminProfile,
+        mustChangePassword: true,
+      };
     } catch (error) {
-      handleFirestoreError(error, OperationType.WRITE, `authCredentials/${username}`);
+      await logoutSession();
+      handleFirestoreError(error, OperationType.WRITE, `users/${adminUid}`);
     }
-
-    saveSession({ userId: adminUid, username });
-    return {
-      user: adminProfile,
-      mustChangePassword: true,
-    };
   }
 
-  const cred = credSnap.data() as AuthCredential;
+  let bindingSnap;
+  try {
+    bindingSnap = await getDocFromServer(doc(db, 'authBindings', authUid));
+  } catch (error) {
+    await logoutSession();
+    handleFirestoreError(error, OperationType.GET, `authBindings/${authUid}`);
+  }
 
-  if (!cred.isActive) {
+  // Recover binding if admin Auth account existed without authBindings doc
+  if (!bindingSnap.exists() && username === DEFAULT_ADMIN_USERNAME) {
+    try {
+      const adminSnap = await getDocFromServer(doc(db, 'users', adminUid));
+      if (adminSnap.exists() && adminSnap.data()?.authUid === authUid) {
+        await setDoc(doc(db, 'authBindings', authUid), {
+          authUid,
+          userId: adminUid,
+          departmentId: spaceId,
+          isActive: true,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+        bindingSnap = await getDocFromServer(doc(db, 'authBindings', authUid));
+      }
+    } catch {
+      // fall through
+    }
+  }
+
+  if (!bindingSnap.exists()) {
+    await logoutSession();
+    throw new Error(
+      'Tài khoản chưa được liên kết với hồ sơ nhân sự trong hệ thống. Vui lòng liên hệ Quản trị hệ thống.'
+    );
+  }
+
+  const binding = bindingSnap.data() as AuthBinding;
+  if (binding.departmentId !== spaceId) {
+    await logoutSession();
+    throw new Error('Tài khoản không thuộc cơ sở dữ liệu hiện tại.');
+  }
+  if (!binding.isActive) {
+    await logoutSession();
     throw new Error('Tài khoản đang bị tạm khóa. Vui lòng liên hệ Quản trị viên phòng ban.');
   }
 
-  if (cred.lockedUntil && cred.lockedUntil > Date.now()) {
-    const minutesLeft = Math.max(1, Math.ceil((cred.lockedUntil - Date.now()) / 60000));
-    throw new Error(
-      `Tài khoản tạm thời bị khóa do nhập sai mật khẩu nhiều lần. Vui lòng thử lại sau ${minutesLeft} phút.`
-    );
+  let userSnap;
+  try {
+    userSnap = await getDocFromServer(doc(db, 'users', binding.userId));
+  } catch (error) {
+    await logoutSession();
+    handleFirestoreError(error, OperationType.GET, `users/${binding.userId}`);
   }
 
-  const isPasswordValid = await verifyPassword(password, cred.passwordHash);
-  if (!isPasswordValid) {
-    const nextAttempts = (cred.failedAttempts || 0) + 1;
-    const shouldLock = nextAttempts >= 5;
-    try {
-      await updateDoc(credRef, {
-        failedAttempts: shouldLock ? 0 : nextAttempts,
-        lockedUntil: shouldLock ? Date.now() + 5 * 60 * 1000 : 0,
-        updatedAt: serverTimestamp(),
-      });
-    } catch {
-      // Non-fatal
-    }
-    if (shouldLock) {
-      throw new Error(
-        'Bạn đã nhập sai mật khẩu 5 lần liên tiếp. Tài khoản tạm khóa trong 5 phút.'
-      );
-    }
-    throw new Error(
-      `Tên đăng nhập hoặc mật khẩu không đúng (còn ${5 - nextAttempts} lần thử).`
-    );
-  }
-
-  const userSnap = await getDoc(doc(db, 'users', cred.userId));
   if (!userSnap.exists()) {
+    await logoutSession();
     throw new Error('Không tìm thấy hồ sơ nhân sự cho tài khoản này.');
   }
-  const user = userSnap.data() as UserProfile;
-  if (!user.isActive) {
+
+  const rawUser = userSnap.data() as Record<string, unknown>;
+  if (!rawUser.isActive) {
+    await logoutSession();
     throw new Error('Tài khoản nhân sự hiện đang bị khóa. Vui lòng liên hệ Quản trị viên.');
   }
 
-  if ((cred.failedAttempts || 0) > 0 || (cred.lockedUntil || 0) > 0) {
-    try {
-      await updateDoc(credRef, {
-        failedAttempts: 0,
-        lockedUntil: 0,
-        updatedAt: serverTimestamp(),
-      });
-    } catch {
-      // Non-fatal
-    }
-  }
+  const spaceKey = await getSpaceAesKey(spaceId);
+  const user = await decodeUserProfileDoc(rawUser, spaceKey);
+  saveSession({ userId: user.uid, username: user.username || username, spaceId });
 
-  saveSession({ userId: user.uid, username });
   return {
-    user: { ...user, username },
-    mustChangePassword: Boolean(cred.mustChangePassword),
+    user,
+    mustChangePassword: Boolean(rawUser.mustChangePassword),
   };
 }
 
 export async function changeOwnPassword(params: {
-  username: string;
+  username?: string;
   currentPassword: string;
   newPassword: string;
 }): Promise<void> {
-  const username = normalizeUsername(params.username);
-  if (!isValidUsernameFormat(username)) {
-    throw new Error('Không xác định được tài khoản đang đăng nhập.');
+  const firebaseUser = auth.currentUser;
+  if (!firebaseUser || !firebaseUser.email || !isInternalAuthEmail(firebaseUser.email)) {
+    throw new Error('Không xác định được phiên tài khoản Firebase Auth đang đăng nhập.');
   }
   if (!params.currentPassword) {
     throw new Error('Vui lòng nhập mật khẩu hiện tại.');
@@ -300,33 +597,40 @@ export async function changeOwnPassword(params: {
     throw new Error(strengthError);
   }
 
-  const credRef = doc(db, 'authCredentials', username);
-  const credSnap = await getDoc(credRef);
-  if (!credSnap.exists()) {
-    throw new Error('Không tìm thấy thông tin xác thực của tài khoản.');
-  }
-
-  const cred = credSnap.data() as AuthCredential;
-  if (!cred.isActive) {
-    throw new Error('Tài khoản đang bị khóa, không thể đổi mật khẩu.');
-  }
-
-  const validCurrent = await verifyPassword(params.currentPassword, cred.passwordHash);
-  if (!validCurrent) {
-    throw new Error('Mật khẩu hiện tại không chính xác.');
-  }
-
-  const newHash = await hashPassword(params.newPassword);
   try {
-    await updateDoc(credRef, {
-      passwordHash: newHash,
-      mustChangePassword: false,
-      failedAttempts: 0,
-      lockedUntil: 0,
-      updatedAt: serverTimestamp(),
-    });
-  } catch (error) {
-    handleFirestoreError(error, OperationType.UPDATE, `authCredentials/${username}`);
+    const credential = EmailAuthProvider.credential(
+      firebaseUser.email,
+      params.currentPassword
+    );
+    await reauthenticateWithCredential(firebaseUser, credential);
+  } catch (err) {
+    const code = getAuthErrorCode(err);
+    if (code === 'auth/wrong-password' || code === 'auth/invalid-credential') {
+      throw new Error('Mật khẩu hiện tại không chính xác.');
+    }
+    if (code === 'auth/too-many-requests') {
+      throw new Error('Nhập sai mật khẩu quá nhiều lần. Vui lòng thử lại sau ít phút.');
+    }
+    throw new Error('Không thể xác thực mật khẩu hiện tại.');
+  }
+
+  await updatePassword(firebaseUser, params.newPassword);
+
+  const bindingSnap = await getDocFromServer(doc(db, 'authBindings', firebaseUser.uid));
+  if (bindingSnap.exists()) {
+    const binding = bindingSnap.data() as AuthBinding;
+    const userRef = doc(db, 'users', binding.userId);
+    const userSnap = await getDocFromServer(userRef);
+    if (userSnap.exists() && userSnap.data()?.mustChangePassword) {
+      try {
+        await updateDoc(userRef, {
+          mustChangePassword: false,
+          updatedAt: serverTimestamp(),
+        });
+      } catch (error) {
+        handleFirestoreError(error, OperationType.UPDATE, `users/${binding.userId}`);
+      }
+    }
   }
 }
 
@@ -363,7 +667,7 @@ export async function logSystemAudit(params: {
       targetId: params.targetId,
       detail: params.detail.slice(0, 1000),
       viewerIds,
-      departmentId: DEPARTMENT_ID,
+      departmentId: getActiveSpaceId(),
       createdAt: serverTimestamp(),
     });
   } catch (error) {
@@ -509,7 +813,7 @@ export async function createOrUpdateTask(params: {
         reviewNote: '',
         isLocked: false,
         participantIds: mergedParticipants,
-        departmentId: DEPARTMENT_ID,
+        departmentId: getActiveSpaceId(),
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
@@ -552,7 +856,7 @@ export async function createOrUpdateTask(params: {
           reviewNote: '',
           isLocked: false,
           participantIds: childParticipants,
-          departmentId: DEPARTMENT_ID,
+          departmentId: getActiveSpaceId(),
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
         });
@@ -614,7 +918,7 @@ export async function createOrUpdateTask(params: {
       reviewNote: '',
       isLocked: false,
       participantIds,
-      departmentId: DEPARTMENT_ID,
+      departmentId: getActiveSpaceId(),
       createdAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
     });
@@ -887,7 +1191,7 @@ export async function saveProject(params: {
         memberIds,
         labels: input.labels.slice(0, 15),
         createdBy: actor.uid,
-        departmentId: DEPARTMENT_ID,
+        departmentId: getActiveSpaceId(),
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
@@ -966,7 +1270,7 @@ export async function saveWorkLog(params: {
         progressPercent: Number(progressPercent),
         note: note.trim().slice(0, 1000),
         viewerIds,
-        departmentId: DEPARTMENT_ID,
+        departmentId: getActiveSpaceId(),
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
@@ -992,7 +1296,7 @@ export async function unlockWorkLogDate(params: {
       workDate,
       unlockedBy: actor.uid,
       reason: reason.trim().slice(0, 500),
-      departmentId: DEPARTMENT_ID,
+      departmentId: getActiveSpaceId(),
       unlockedAt: serverTimestamp(),
     });
     await logSystemAudit({
@@ -1036,40 +1340,102 @@ export async function saveUserByAdmin(params: {
     );
   }
 
-  if (!existing) {
+  const spaceId = getActiveSpaceId();
+  const spaceKey = await getOrInitSpaceAesKey(spaceId);
+
+  const duplicateUser = allUsers.find(
+    (u) => u.uid !== uid && normalizeUsername(u.username || '') === username && username !== ''
+  );
+  if (duplicateUser) {
+    throw new Error(`Tên đăng nhập "${username}" đã tồn tại. Vui lòng chọn tên khác.`);
+  }
+
+  const needsAuthProvision = !existing || !existing.authUid;
+  let provisionedAuthUser: Awaited<ReturnType<typeof createUserWithEmailAndPassword>>['user'] | null =
+    null;
+
+  if (needsAuthProvision) {
     if (!username) {
-      throw new Error('Vui lòng nhập tên đăng nhập cho tài khoản mới.');
-    }
-    const existingCredSnap = await getDoc(doc(db, 'authCredentials', username));
-    if (existingCredSnap.exists()) {
-      throw new Error(`Tên đăng nhập "${username}" đã tồn tại. Vui lòng chọn tên khác.`);
+      throw new Error('Vui lòng nhập tên đăng nhập cho tài khoản.');
     }
     const pwd = input.initialPassword || '';
     const strengthErr = validatePasswordStrength(pwd);
     if (strengthErr) {
       throw new Error(`Mật khẩu khởi tạo không đạt yêu cầu: ${strengthErr}`);
     }
+
+    const internalEmail = getInternalAuthEmail(username);
+    try {
+      const cred = await createUserWithEmailAndPassword(
+        provisionerAuth,
+        internalEmail,
+        pwd
+      );
+      provisionedAuthUser = cred.user;
+    } catch (err) {
+      const code = getAuthErrorCode(err);
+      if (code === 'auth/email-already-in-use') {
+        throw new Error(
+          `Tên đăng nhập "${username}" đã tồn tại trên hệ thống xác thực Firebase Auth.`
+        );
+      }
+      if (code === 'auth/operation-not-allowed') {
+        throw new Error(
+          'Phương thức Email/Password chưa được bật trong Firebase Authentication.'
+        );
+      }
+      throw new Error(
+        err instanceof Error ? err.message : 'Không thể khởi tạo tài khoản Firebase Auth.'
+      );
+    }
   }
+
+  const resolvedAuthUid = provisionedAuthUser?.uid || existing?.authUid || '';
+  const payload: EncryptedAccountPayload = {
+    username,
+    employeeCode: input.employeeCode.trim().slice(0, 32),
+    fullName: input.fullName.trim().slice(0, 120),
+    title: input.title.trim().slice(0, 120),
+    email: emailLower,
+  };
+  const encryptedAccount = await encryptAccountData(spaceKey, payload);
+  const resolvedActive = existing && existing.uid === actor.uid ? true : input.isActive;
 
   try {
     if (existing) {
-      await updateDoc(doc(db, 'users', uid), {
-        ...(username ? { username } : {}),
-        employeeCode: input.employeeCode.trim().slice(0, 32),
-        fullName: input.fullName.trim().slice(0, 120),
-        title: input.title.trim().slice(0, 120),
+      const existingSnap = await getDocFromServer(doc(db, 'users', uid));
+      const existingRaw = existingSnap.exists() ? existingSnap.data() : null;
+      await setDoc(doc(db, 'users', uid), {
+        uid,
+        authUid: resolvedAuthUid,
+        encryptedAccount,
+        mustChangePassword: provisionedAuthUser
+          ? true
+          : Boolean(existingRaw?.mustChangePassword),
         roles: input.roles,
         groupId: input.groupId,
         managerId: input.managerId,
-        isActive: existing.uid === actor.uid ? true : input.isActive,
+        isActive: resolvedActive,
+        departmentId: spaceId,
+        createdAt: existingRaw?.createdAt || serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
 
-      if (username && existing.uid !== actor.uid) {
-        const credSnap = await getDoc(doc(db, 'authCredentials', username));
-        if (credSnap.exists()) {
-          await updateDoc(doc(db, 'authCredentials', username), {
-            isActive: input.isActive,
+      if (provisionedAuthUser) {
+        await setDoc(doc(db, 'authBindings', resolvedAuthUid), {
+          authUid: resolvedAuthUid,
+          userId: uid,
+          departmentId: spaceId,
+          isActive: resolvedActive,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      } else if (existing.uid !== actor.uid && resolvedAuthUid) {
+        const bindingRef = doc(db, 'authBindings', resolvedAuthUid);
+        const bindingSnap = await getDocFromServer(bindingRef);
+        if (bindingSnap.exists()) {
+          await updateDoc(bindingRef, {
+            isActive: resolvedActive,
             updatedAt: serverTimestamp(),
           });
         }
@@ -1077,38 +1443,33 @@ export async function saveUserByAdmin(params: {
     } else {
       await setDoc(doc(db, 'users', uid), {
         uid,
-        username,
-        employeeCode: input.employeeCode.trim().slice(0, 32),
-        fullName: input.fullName.trim().slice(0, 120),
-        title: input.title.trim().slice(0, 120),
+        authUid: resolvedAuthUid,
+        encryptedAccount,
+        mustChangePassword: true,
         roles: input.roles,
         groupId: input.groupId,
         managerId: input.managerId,
-        isActive: input.isActive,
-        departmentId: DEPARTMENT_ID,
+        isActive: resolvedActive,
+        departmentId: spaceId,
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
 
-      const passwordHash = await hashPassword(input.initialPassword!);
-      await setDoc(doc(db, 'authCredentials', username), {
-        username,
+      await setDoc(doc(db, 'authBindings', resolvedAuthUid), {
+        authUid: resolvedAuthUid,
         userId: uid,
-        passwordHash,
-        mustChangePassword: true,
-        isActive: input.isActive,
-        failedAttempts: 0,
-        lockedUntil: 0,
-        departmentId: DEPARTMENT_ID,
+        departmentId: spaceId,
+        isActive: resolvedActive,
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
     }
 
     if (emailLower) {
+      const encryptedPrivate = await encryptPrivateData(spaceKey, { email: emailLower });
       await setDoc(doc(db, 'users', uid, 'private', 'info'), {
         uid,
-        email: emailLower,
+        encryptedPrivate,
         updatedAt: serverTimestamp(),
       });
     }
@@ -1122,7 +1483,20 @@ export async function saveUserByAdmin(params: {
       allUsers,
     });
   } catch (error) {
+    if (provisionedAuthUser) {
+      try {
+        await deleteUser(provisionedAuthUser);
+      } catch {
+        // ignore rollback error
+      }
+    }
     handleFirestoreError(error, OperationType.WRITE, `users/${uid}`);
+  } finally {
+    try {
+      await signOut(provisionerAuth);
+    } catch {
+      // ignore
+    }
   }
 }
 
@@ -1133,20 +1507,24 @@ export async function toggleUserLockByAdmin(params: {
   allUsers: UserProfile[];
 }): Promise<void> {
   const { targetUser, nextActive, actor, allUsers } = params;
+  if (!targetUser.authUid || !targetUser.encryptedAccount) {
+    throw new Error(
+      'Tài khoản cũ chưa kích hoạt Firebase Auth & mã hóa dữ liệu. Vui lòng bấm "Kích hoạt Auth" hoặc "Sửa" cho nhân sự này trước.'
+    );
+  }
   try {
     const batch = writeBatch(db);
     batch.update(doc(db, 'users', targetUser.uid), {
       isActive: nextActive,
       updatedAt: serverTimestamp(),
     });
-    if (targetUser.username) {
-      const credSnap = await getDoc(doc(db, 'authCredentials', targetUser.username));
-      if (credSnap.exists()) {
-        batch.update(doc(db, 'authCredentials', targetUser.username), {
-          isActive: nextActive,
-          updatedAt: serverTimestamp(),
-        });
-      }
+    const bindingRef = doc(db, 'authBindings', targetUser.authUid);
+    const bindingSnap = await getDocFromServer(bindingRef);
+    if (bindingSnap.exists()) {
+      batch.update(bindingRef, {
+        isActive: nextActive,
+        updatedAt: serverTimestamp(),
+      });
     }
     await batch.commit();
 
@@ -1163,16 +1541,26 @@ export async function toggleUserLockByAdmin(params: {
   }
 }
 
-export async function resetUserPasswordByAdmin(params: {
+export async function activateLegacyUserAuthByAdmin(params: {
   targetUser: UserProfile;
   usernameInput?: string;
-  newPassword: string;
+  initialPassword: string;
   requireChangeOnNextLogin: boolean;
   actor: UserProfile;
   allUsers: UserProfile[];
 }): Promise<void> {
-  const { targetUser, usernameInput, newPassword, requireChangeOnNextLogin, actor, allUsers } =
-    params;
+  const {
+    targetUser,
+    usernameInput,
+    initialPassword,
+    requireChangeOnNextLogin,
+    actor,
+    allUsers,
+  } = params;
+
+  if (targetUser.authUid) {
+    throw new Error('Nhân sự này đã được kích hoạt tài khoản Firebase Auth.');
+  }
 
   const username = normalizeUsername(targetUser.username || usernameInput || '');
   if (!isValidUsernameFormat(username)) {
@@ -1180,56 +1568,101 @@ export async function resetUserPasswordByAdmin(params: {
       'Tên đăng nhập không hợp lệ (2–64 ký tự gồm a-z, 0-9, dấu chấm, gạch dưới hoặc gạch ngang).'
     );
   }
-  const strengthError = validatePasswordStrength(newPassword);
+  const strengthError = validatePasswordStrength(initialPassword);
   if (strengthError) {
     throw new Error(strengthError);
   }
 
-  const passwordHash = await hashPassword(newPassword);
-  const credRef = doc(db, 'authCredentials', username);
-  const credSnap = await getDoc(credRef);
+  const spaceId = getActiveSpaceId();
+  const spaceKey = await getOrInitSpaceAesKey(spaceId);
+  const internalEmail = getInternalAuthEmail(username);
 
+  let provisionedUser: Awaited<ReturnType<typeof createUserWithEmailAndPassword>>['user'] | null =
+    null;
   try {
-    if (!targetUser.username) {
-      await updateDoc(doc(db, 'users', targetUser.uid), {
-        username,
-        updatedAt: serverTimestamp(),
-      });
-    }
+    const cred = await createUserWithEmailAndPassword(
+      provisionerAuth,
+      internalEmail,
+      initialPassword
+    );
+    provisionedUser = cred.user;
 
-    if (credSnap.exists()) {
-      await updateDoc(credRef, {
-        passwordHash,
-        mustChangePassword: requireChangeOnNextLogin,
-        failedAttempts: 0,
-        lockedUntil: 0,
-        updatedAt: serverTimestamp(),
-      });
-    } else {
-      await setDoc(credRef, {
-        username,
-        userId: targetUser.uid,
-        passwordHash,
-        mustChangePassword: requireChangeOnNextLogin,
-        isActive: targetUser.isActive,
-        failedAttempts: 0,
-        lockedUntil: 0,
-        departmentId: DEPARTMENT_ID,
-        createdAt: serverTimestamp(),
+    const existingSnap = await getDocFromServer(doc(db, 'users', targetUser.uid));
+    const existingRaw = existingSnap.exists() ? existingSnap.data() : null;
+    const email = await fetchUserEmailForAdmin(targetUser.uid);
+
+    const encryptedAccount = await encryptAccountData(spaceKey, {
+      username,
+      employeeCode: targetUser.employeeCode,
+      fullName: targetUser.fullName,
+      title: targetUser.title || '',
+      email,
+    });
+
+    await setDoc(doc(db, 'users', targetUser.uid), {
+      uid: targetUser.uid,
+      authUid: provisionedUser.uid,
+      encryptedAccount,
+      mustChangePassword: requireChangeOnNextLogin,
+      roles: targetUser.roles,
+      groupId: targetUser.groupId || '',
+      managerId: targetUser.managerId || '',
+      isActive: targetUser.isActive,
+      departmentId: spaceId,
+      createdAt: existingRaw?.createdAt || serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+
+    await setDoc(doc(db, 'authBindings', provisionedUser.uid), {
+      authUid: provisionedUser.uid,
+      userId: targetUser.uid,
+      departmentId: spaceId,
+      isActive: targetUser.isActive,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+
+    if (email) {
+      const encryptedPrivate = await encryptPrivateData(spaceKey, { email });
+      await setDoc(doc(db, 'users', targetUser.uid, 'private', 'info'), {
+        uid: targetUser.uid,
+        encryptedPrivate,
         updatedAt: serverTimestamp(),
       });
     }
 
     await logSystemAudit({
       actor,
-      action: 'Đặt lại mật khẩu',
+      action: 'Kích hoạt Firebase Auth',
       targetType: 'user',
       targetId: targetUser.uid,
-      detail: `Đặt lại mật khẩu cho ${targetUser.fullName} (@${username})${requireChangeOnNextLogin ? ' · Bắt buộc đổi MK lần sau' : ''}`,
+      detail: `Kích hoạt đăng nhập Firebase Auth & mã hóa hồ sơ cho ${targetUser.fullName} (@${username})`,
       allUsers,
     });
   } catch (error) {
-    handleFirestoreError(error, OperationType.WRITE, `authCredentials/${username}`);
+    if (provisionedUser) {
+      try {
+        await deleteUser(provisionedUser);
+      } catch {
+        // ignore
+      }
+    }
+    const code = getAuthErrorCode(error);
+    if (code === 'auth/email-already-in-use') {
+      throw new Error(`Tên đăng nhập "${username}" đã tồn tại trên Firebase Auth.`);
+    }
+    if (code === 'auth/operation-not-allowed') {
+      throw new Error(
+        'Phương thức Email/Password chưa được bật trong Firebase Authentication.'
+      );
+    }
+    handleFirestoreError(error, OperationType.WRITE, `users/${targetUser.uid}`);
+  } finally {
+    try {
+      await signOut(provisionerAuth);
+    } catch {
+      // ignore
+    }
   }
 }
 
@@ -1255,7 +1688,7 @@ export async function createGroupByAdmin(params: {
       description: description.trim().slice(0, 500),
       leaderId: leaderId || '',
       memberUids,
-      departmentId: DEPARTMENT_ID,
+      departmentId: getActiveSpaceId(),
       createdAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
     });
@@ -1312,8 +1745,10 @@ export async function saveSystemConfigByAdmin(params: {
   allUsers: UserProfile[];
 }): Promise<void> {
   const { config, actor, allUsers } = params;
+  const spaceId = getActiveSpaceId();
+  const cfgId = getSystemConfigDocId();
   try {
-    await setDoc(doc(db, 'systemConfigs', 'department'), {
+    await setDoc(doc(db, 'systemConfigs', cfgId), {
       lockHour: Number(config.lockHour),
       lockMinute: Number(config.lockMinute),
       reminderHour: Number(config.reminderHour),
@@ -1321,6 +1756,7 @@ export async function saveSystemConfigByAdmin(params: {
       timezone: 'Asia/Ho_Chi_Minh',
       defaultLabels: config.defaultLabels.slice(0, 30),
       holidays: (config.holidays || []).slice(0, 50),
+      departmentId: spaceId,
       updatedBy: actor.uid,
       updatedAt: serverTimestamp(),
     });
@@ -1328,12 +1764,12 @@ export async function saveSystemConfigByAdmin(params: {
       actor,
       action: 'Cập nhật cấu hình hệ thống',
       targetType: 'systemConfig',
-      targetId: 'department',
+      targetId: cfgId,
       detail: `Giờ khóa ngày: ${config.lockHour}:${String(config.lockMinute).padStart(2, '0')} UTC+7`,
       allUsers,
     });
   } catch (error) {
-    handleFirestoreError(error, OperationType.WRITE, 'systemConfigs/department');
+    handleFirestoreError(error, OperationType.WRITE, `systemConfigs/${cfgId}`);
   }
 }
 
@@ -1342,11 +1778,14 @@ export async function wipeAllDepartmentData(actor: UserProfile): Promise<{
   normalizedAdmin: UserProfile;
 }> {
   let deletedDocs = 0;
+  const spaceId = getActiveSpaceId();
+  const cfgId = getSystemConfigDocId();
+  const defaultAdminUid = getDefaultAdminUid();
 
   try {
     // 1. Delete tasks and their subcollections (subtasks, comments, auditLogs)
     const tasksSnap = await getDocs(
-      query(collection(db, 'tasks'), where('departmentId', '==', DEPARTMENT_ID))
+      query(collection(db, 'tasks'), where('departmentId', '==', spaceId))
     );
     const subDeleteOps: Array<(b: WriteBatch) => void> = [];
     const taskDeleteOps: Array<(b: WriteBatch) => void> = [];
@@ -1376,12 +1815,10 @@ export async function wipeAllDepartmentData(actor: UserProfile): Promise<{
     if (subDeleteOps.length > 0) await runBatchOps(subDeleteOps);
     if (taskDeleteOps.length > 0) await runBatchOps(taskDeleteOps);
 
-    // 2. Delete workLogs (tasks are now gone so rule allows cleanup) & workLogUnlocks
+    // 2. Delete workLogs & workLogUnlocks
     const [wlSnap, ulSnap] = await Promise.all([
-      getDocs(query(collection(db, 'workLogs'), where('departmentId', '==', DEPARTMENT_ID))),
-      getDocs(
-        query(collection(db, 'workLogUnlocks'), where('departmentId', '==', DEPARTMENT_ID))
-      ),
+      getDocs(query(collection(db, 'workLogs'), where('departmentId', '==', spaceId))),
+      getDocs(query(collection(db, 'workLogUnlocks'), where('departmentId', '==', spaceId))),
     ]);
     const wlOps: Array<(b: WriteBatch) => void> = [];
     for (const d of wlSnap.docs) {
@@ -1396,7 +1833,7 @@ export async function wipeAllDepartmentData(actor: UserProfile): Promise<{
 
     // 3. Delete projects & project members
     const prjSnap = await getDocs(
-      query(collection(db, 'projects'), where('departmentId', '==', DEPARTMENT_ID))
+      query(collection(db, 'projects'), where('departmentId', '==', spaceId))
     );
     const prjMemberOps: Array<(b: WriteBatch) => void> = [];
     const prjDeleteOps: Array<(b: WriteBatch) => void> = [];
@@ -1412,11 +1849,11 @@ export async function wipeAllDepartmentData(actor: UserProfile): Promise<{
     if (prjMemberOps.length > 0) await runBatchOps(prjMemberOps);
     if (prjDeleteOps.length > 0) await runBatchOps(prjDeleteOps);
 
-    // 4. Delete groups, system auditLogs, and systemConfigs/department
+    // 4. Delete groups, system auditLogs, and systemConfigs
     const [grpSnap, audSnap, cfgSnap] = await Promise.all([
-      getDocs(query(collection(db, 'groups'), where('departmentId', '==', DEPARTMENT_ID))),
-      getDocs(query(collection(db, 'auditLogs'), where('departmentId', '==', DEPARTMENT_ID))),
-      getDoc(doc(db, 'systemConfigs', 'department')),
+      getDocs(query(collection(db, 'groups'), where('departmentId', '==', spaceId))),
+      getDocs(query(collection(db, 'auditLogs'), where('departmentId', '==', spaceId))),
+      getDoc(doc(db, 'systemConfigs', cfgId)),
     ]);
     const miscOps: Array<(b: WriteBatch) => void> = [];
     for (const d of grpSnap.docs) {
@@ -1433,39 +1870,65 @@ export async function wipeAllDepartmentData(actor: UserProfile): Promise<{
     }
     if (miscOps.length > 0) await runBatchOps(miscOps);
 
-    // 5. Delete all non-admin users, their private info, and their authCredentials
+    // 5. Delete non-admin users' private info & authBindings BEFORE user docs
     const usersSnap = await getDocs(
-      query(collection(db, 'users'), where('departmentId', '==', DEPARTMENT_ID))
+      query(collection(db, 'users'), where('departmentId', '==', spaceId))
     );
-    const userOps: Array<(b: WriteBatch) => void> = [];
+    const bindingAndPrivateOps: Array<(b: WriteBatch) => void> = [];
+    const userDeleteOps: Array<(b: WriteBatch) => void> = [];
     for (const uDoc of usersSnap.docs) {
-      const uData = uDoc.data() as UserProfile;
-      if (uDoc.id === actor.uid || uDoc.id === 'usr_mbfs_admin') {
+      const uData = uDoc.data() as Record<string, unknown>;
+      if (uDoc.id === actor.uid || uDoc.id === defaultAdminUid) {
         continue;
       }
-      if (uData.username && uData.username !== DEFAULT_ADMIN_USERNAME) {
-        userOps.push((b) => b.delete(doc(db, 'authCredentials', uData.username!)));
+      if (typeof uData.authUid === 'string' && uData.authUid) {
+        const bUid = uData.authUid;
+        bindingAndPrivateOps.push((b) => b.delete(doc(db, 'authBindings', bUid)));
         deletedDocs += 1;
       }
-      userOps.push((b) => b.delete(doc(db, 'users', uDoc.id, 'private', 'info')));
-      userOps.push((b) => b.delete(uDoc.ref));
+      bindingAndPrivateOps.push((b) => b.delete(doc(db, 'users', uDoc.id, 'private', 'info')));
+      userDeleteOps.push((b) => b.delete(uDoc.ref));
       deletedDocs += 1;
     }
-    if (userOps.length > 0) await runBatchOps(userOps);
+    if (bindingAndPrivateOps.length > 0) await runBatchOps(bindingAndPrivateOps);
+    if (userDeleteOps.length > 0) await runBatchOps(userDeleteOps);
 
-    // 6. Normalize kept Admin account as pure ADMIN (not Trưởng phòng)
+    // 6. Normalize kept Admin account as pure ADMIN (encrypted)
+    const spaceKey = await getOrInitSpaceAesKey(spaceId);
+    const actorSnap = await getDocFromServer(doc(db, 'users', actor.uid));
+    const actorRaw = actorSnap.exists() ? (actorSnap.data() as Record<string, unknown>) : null;
+    const resolvedAuthUid =
+      (actorRaw && typeof actorRaw.authUid === 'string' && actorRaw.authUid) ||
+      actor.authUid ||
+      '';
     const normalizedRoles: RoleCode[] = ['ADMIN'];
-    await updateDoc(doc(db, 'users', actor.uid), {
+    const adminPayload: EncryptedAccountPayload = {
+      username: actor.username || DEFAULT_ADMIN_USERNAME,
+      employeeCode: actor.employeeCode || 'AD-01',
+      fullName: actor.fullName || 'Quản trị hệ thống',
       title: 'Quản trị hệ thống',
+      email: actor.email || '',
+    };
+    const encryptedAccount = await encryptAccountData(spaceKey, adminPayload);
+
+    await setDoc(doc(db, 'users', actor.uid), {
+      uid: actor.uid,
+      authUid: resolvedAuthUid,
+      encryptedAccount,
+      mustChangePassword: Boolean(actorRaw?.mustChangePassword),
       roles: normalizedRoles,
       groupId: '',
       managerId: '',
       isActive: true,
+      departmentId: spaceId,
+      createdAt: actorRaw?.createdAt || serverTimestamp(),
       updatedAt: serverTimestamp(),
     });
 
     const normalizedAdmin: UserProfile = {
       ...actor,
+      authUid: resolvedAuthUid,
+      encryptedAccount,
       title: 'Quản trị hệ thống',
       roles: normalizedRoles,
       groupId: '',
@@ -1477,22 +1940,25 @@ export async function wipeAllDepartmentData(actor: UserProfile): Promise<{
       actor: normalizedAdmin,
       action: 'Xóa toàn bộ dữ liệu',
       targetType: 'system',
-      targetId: DEPARTMENT_ID,
-      detail: `Đã xóa toàn bộ ${deletedDocs} bản ghi dữ liệu, chỉ giữ lại tài khoản Quản trị hệ thống (@${actor.username || DEFAULT_ADMIN_USERNAME})`,
+      targetId: spaceId,
+      detail: `Đã xóa toàn bộ ${deletedDocs} bản ghi dữ liệu, chỉ giữ lại tài khoản Quản trị hệ thống (@${adminPayload.username})`,
       allUsers: [normalizedAdmin],
     });
 
     return { deletedDocs, normalizedAdmin };
   } catch (error) {
-    handleFirestoreError(error, OperationType.DELETE, 'department/wipeAll');
+    handleFirestoreError(error, OperationType.DELETE, `${spaceId}/wipeAll`);
   }
 }
 
 export async function fetchUserEmailForAdmin(userId: string): Promise<string> {
   try {
-    const snap = await getDoc(doc(db, 'users', userId, 'private', 'info'));
+    const [snap, spaceKey] = await Promise.all([
+      getDoc(doc(db, 'users', userId, 'private', 'info')),
+      getSpaceAesKey(getActiveSpaceId()),
+    ]);
     if (snap.exists()) {
-      return (snap.data() as { email?: string }).email || '';
+      return decryptPrivateEmail(snap.data() as Record<string, unknown>, spaceKey);
     }
     return '';
   } catch {
@@ -1504,3 +1970,28 @@ export function getTodayWorkDateVN(): { dateStr: string; dateNum: number } {
   const { dateStr, dateNum } = getVietnamNowParts();
   return { dateStr, dateNum };
 }
+
+export interface GoogleDbAdminUser {
+  uid: string;
+  email: string;
+  displayName: string;
+}
+
+export async function signInGoogleForDbAdmin(): Promise<GoogleDbAdminUser> {
+  const result = await signInWithPopup(auth, googleProvider);
+  const email = (result.user.email || '').trim().toLowerCase();
+  if (!email) {
+    await signOut(auth);
+    throw new Error('Không lấy được địa chỉ Gmail từ tài khoản Google vừa đăng nhập.');
+  }
+  return {
+    uid: result.user.uid,
+    email,
+    displayName: result.user.displayName || email,
+  };
+}
+
+export async function signOutGoogleForDbAdmin(): Promise<void> {
+  await logoutSession();
+}
+

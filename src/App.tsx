@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
+import { onAuthStateChanged } from 'firebase/auth';
 import {
   collection,
   doc,
@@ -22,7 +23,6 @@ import {
   X,
 } from 'lucide-react';
 import {
-  DEPARTMENT_ID,
   Project,
   ROLE_LABELS,
   SystemAuditLog,
@@ -33,8 +33,19 @@ import {
   WorkLog,
   WorkLogUnlock,
 } from './types/domain';
-import { db, handleFirestoreError, OperationType } from './lib/firebase';
-import { logoutSession, restoreCurrentSession } from './lib/firestoreService';
+import {
+  auth,
+  db,
+  getActiveSpaceId,
+  getSystemConfigDocId,
+  handleFirestoreError,
+  OperationType,
+} from './lib/firebase';
+import {
+  decodeUserProfiles,
+  logoutSession,
+  restoreCurrentSession,
+} from './lib/firestoreService';
 import {
   canViewAdminSection,
   getVisibleTasks,
@@ -88,6 +99,8 @@ function AppContent() {
   const [editingTask, setEditingTask] = useState<TaskItem | null>(null);
   const [changePassOpen, setChangePassOpen] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
+  const [authNotice, setAuthNotice] = useState('');
+  const [syncSuspended, setSyncSuspended] = useState(false);
 
   function showToast(msg: string) {
     setToast(msg);
@@ -114,16 +127,27 @@ function AppContent() {
     };
   }, []);
 
+  useEffect(() => {
+    if (!authReady) return;
+    const unsub = onAuthStateChanged(auth, (fbUser) => {
+      if (!fbUser && !syncSuspended && currentUser) {
+        setCurrentUser(null);
+        setMustChangePassword(false);
+        resetLoadedCollections();
+      }
+    });
+    return () => unsub();
+  }, [authReady, syncSuspended, currentUser]);
+
   function handleAuthenticated(res: { user: UserProfile; mustChangePassword: boolean }) {
+    setAuthNotice('');
+    setSyncSuspended(false);
     setCurrentUser(res.user);
     setMustChangePassword(res.mustChangePassword);
     setActiveNav('WORKSPACE');
   }
 
-  function handleLogout() {
-    logoutSession();
-    setCurrentUser(null);
-    setMustChangePassword(false);
+  function resetLoadedCollections() {
     setUsers([]);
     setGroups([]);
     setProjects([]);
@@ -131,23 +155,56 @@ function AppContent() {
     setWorkLogs([]);
     setUnlocks([]);
     setAuditLogs([]);
+    setConfig(null);
     setSelectedTaskId(null);
+  }
+
+  async function handleLogout() {
+    setSyncSuspended(false);
+    await logoutSession();
+    setCurrentUser(null);
+    setMustChangePassword(false);
+    resetLoadedCollections();
     setUserMenuOpen(false);
   }
 
+  async function handleRequireRelogin(notice: string) {
+    setSyncSuspended(false);
+    await logoutSession();
+    setCurrentUser(null);
+    setMustChangePassword(false);
+    resetLoadedCollections();
+    setUserMenuOpen(false);
+    setAuthNotice(notice);
+  }
+
   useEffect(() => {
-    if (!authReady || !currentUser || mustChangePassword) return;
+    if (!authReady || !currentUser || mustChangePassword || syncSuspended) return;
+
+    let cancelled = false;
+    const spaceId = getActiveSpaceId();
+    const cfgDocId = getSystemConfigDocId();
 
     const unsubUsers = onSnapshot(
-      query(collection(db, 'users'), where('departmentId', '==', DEPARTMENT_ID)),
+      query(collection(db, 'users'), where('departmentId', '==', spaceId)),
       (snap) => {
-        setUsers(snap.docs.map((d) => d.data() as UserProfile));
+        decodeUserProfiles(
+          snap.docs.map((d) => d.data() as Record<string, unknown>),
+          spaceId
+        ).then((decoded) => {
+          if (cancelled) return;
+          setUsers(decoded);
+          const updatedSelf = decoded.find((u) => u.uid === currentUser.uid);
+          if (updatedSelf) {
+            setCurrentUser(updatedSelf);
+          }
+        });
       },
       (err) => handleFirestoreError(err, OperationType.LIST, 'users')
     );
 
     const unsubGroups = onSnapshot(
-      query(collection(db, 'groups'), where('departmentId', '==', DEPARTMENT_ID)),
+      query(collection(db, 'groups'), where('departmentId', '==', spaceId)),
       (snap) => {
         setGroups(
           snap.docs
@@ -159,7 +216,7 @@ function AppContent() {
     );
 
     const unsubProjects = onSnapshot(
-      query(collection(db, 'projects'), where('departmentId', '==', DEPARTMENT_ID)),
+      query(collection(db, 'projects'), where('departmentId', '==', spaceId)),
       (snap) => {
         setProjects(snap.docs.map((d) => d.data() as Project));
       },
@@ -167,7 +224,7 @@ function AppContent() {
     );
 
     const unsubTasks = onSnapshot(
-      query(collection(db, 'tasks'), where('departmentId', '==', DEPARTMENT_ID)),
+      query(collection(db, 'tasks'), where('departmentId', '==', spaceId)),
       (snap) => {
         setTasks(snap.docs.map((d) => d.data() as TaskItem));
       },
@@ -175,7 +232,7 @@ function AppContent() {
     );
 
     const unsubWorkLogs = onSnapshot(
-      query(collection(db, 'workLogs'), where('departmentId', '==', DEPARTMENT_ID)),
+      query(collection(db, 'workLogs'), where('departmentId', '==', spaceId)),
       (snap) => {
         setWorkLogs(snap.docs.map((d) => d.data() as WorkLog));
       },
@@ -183,7 +240,7 @@ function AppContent() {
     );
 
     const unsubUnlocks = onSnapshot(
-      query(collection(db, 'workLogUnlocks'), where('departmentId', '==', DEPARTMENT_ID)),
+      query(collection(db, 'workLogUnlocks'), where('departmentId', '==', spaceId)),
       (snap) => {
         setUnlocks(snap.docs.map((d) => d.data() as WorkLogUnlock));
       },
@@ -191,17 +248,17 @@ function AppContent() {
     );
 
     const unsubConfig = onSnapshot(
-      doc(db, 'systemConfigs', 'department'),
+      doc(db, 'systemConfigs', cfgDocId),
       (snap) => {
         if (snap.exists()) {
           setConfig(snap.data() as SystemConfig);
         }
       },
-      (err) => handleFirestoreError(err, OperationType.GET, 'systemConfigs/department')
+      (err) => handleFirestoreError(err, OperationType.GET, `systemConfigs/${cfgDocId}`)
     );
 
     const unsubAudits = onSnapshot(
-      query(collection(db, 'auditLogs'), where('departmentId', '==', DEPARTMENT_ID)),
+      query(collection(db, 'auditLogs'), where('departmentId', '==', spaceId)),
       (snap) => {
         setAuditLogs(snap.docs.map((d) => d.data() as SystemAuditLog));
       },
@@ -209,6 +266,7 @@ function AppContent() {
     );
 
     return () => {
+      cancelled = true;
       unsubUsers();
       unsubGroups();
       unsubProjects();
@@ -218,7 +276,7 @@ function AppContent() {
       unsubConfig();
       unsubAudits();
     };
-  }, [authReady, currentUser?.uid, mustChangePassword]);
+  }, [authReady, currentUser?.uid, mustChangePassword, syncSuspended]);
 
   const visibleProjects = useMemo(() => {
     if (!currentUser) return [];
@@ -275,7 +333,12 @@ function AppContent() {
   }
 
   if (!currentUser) {
-    return <AuthScreen onAuthenticated={handleAuthenticated} />;
+    return (
+      <AuthScreen
+        onAuthenticated={handleAuthenticated}
+        notice={authNotice}
+      />
+    );
   }
 
   if (mustChangePassword) {
@@ -415,8 +478,8 @@ function AppContent() {
               <Menu className="w-5 h-5" />
             </button>
             <div className="flex items-center gap-2 text-sm min-w-0">
-              <span className="hidden sm:inline text-slate-400 whitespace-nowrap">
-                Phòng Hành chính – Nghiệp vụ
+              <span className="hidden sm:inline text-slate-400 whitespace-nowrap truncate max-w-[260px]">
+                Phòng Hành chính – Nghiệp vụ (DAMA2)
               </span>
               <span className="hidden sm:inline text-slate-300" aria-hidden="true">
                 /
@@ -568,6 +631,8 @@ function AppContent() {
               auditLogs={visibleAuditLogs}
               onNotify={showToast}
               onCurrentUserUpdated={(updated) => setCurrentUser(updated)}
+              onSetSyncSuspended={setSyncSuspended}
+              onRequireRelogin={handleRequireRelogin}
             />
           )}
         </main>

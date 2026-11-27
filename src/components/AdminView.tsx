@@ -1,14 +1,19 @@
-import React, { useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
+import { onAuthStateChanged } from 'firebase/auth';
 import {
   AlertTriangle,
+  CheckCircle2,
   Database,
   Download,
   Edit3,
   KeyRound,
   Lock,
+  LogOut,
+  Mail,
   Plus,
-  Settings,
   Shield,
+  ShieldCheck,
+  Settings,
   Trash2,
   Unlock,
   Upload,
@@ -29,12 +34,21 @@ import {
   ImportSummary,
 } from '../lib/excelBackup';
 import {
+  auth,
+  DAMA2_SUPER_ADMIN_EMAIL,
+  isInternalAuthEmail,
+  maskEmail,
+} from '../lib/firebase';
+import {
+  activateLegacyUserAuthByAdmin,
   createGroupByAdmin,
   fetchUserEmailForAdmin,
-  resetUserPasswordByAdmin,
+  GoogleDbAdminUser,
   saveGroupByAdmin,
   saveSystemConfigByAdmin,
   saveUserByAdmin,
+  signInGoogleForDbAdmin,
+  signOutGoogleForDbAdmin,
   toggleUserLockByAdmin,
   wipeAllDepartmentData,
 } from '../lib/firestoreService';
@@ -49,6 +63,8 @@ interface AdminViewProps {
   auditLogs: SystemAuditLog[];
   onNotify: (msg: string) => void;
   onCurrentUserUpdated?: (updated: UserProfile) => void;
+  onSetSyncSuspended?: (suspended: boolean) => void;
+  onRequireRelogin?: (notice: string) => void;
 }
 
 export function AdminView({
@@ -59,6 +75,8 @@ export function AdminView({
   auditLogs,
   onNotify,
   onCurrentUserUpdated,
+  onSetSyncSuspended,
+  onRequireRelogin,
 }: AdminViewProps) {
   const [tab, setTab] = useState<'USERS' | 'GROUPS' | 'CONFIG' | 'DATA' | 'AUDIT'>('USERS');
   const isAdmin = canManageUsers(currentUser);
@@ -79,14 +97,14 @@ export function AdminView({
   const [userModalError, setUserModalError] = useState('');
   const [savingUser, setSavingUser] = useState(false);
 
-  // Reset password modal
-  const [resetTargetUser, setResetTargetUser] = useState<UserProfile | null>(null);
-  const [resetUsername, setResetUsername] = useState('');
-  const [resetPassword, setResetPassword] = useState('');
-  const [resetConfirm, setResetConfirm] = useState('');
-  const [resetMustChange, setResetMustChange] = useState(true);
-  const [resetError, setResetError] = useState('');
-  const [resetting, setResetting] = useState(false);
+  // Activate Firebase Auth modal (for legacy users without authUid)
+  const [activateTargetUser, setActivateTargetUser] = useState<UserProfile | null>(null);
+  const [activateUsername, setActivateUsername] = useState('');
+  const [activatePassword, setActivatePassword] = useState('');
+  const [activateConfirm, setActivateConfirm] = useState('');
+  const [activateMustChange, setActivateMustChange] = useState(true);
+  const [activateError, setActivateError] = useState('');
+  const [activating, setActivating] = useState(false);
 
   // Group create / edit modal
   const [groupModalOpen, setGroupModalOpen] = useState(false);
@@ -104,6 +122,14 @@ export function AdminView({
   const [reminderMinute, setReminderMinute] = useState(String(config?.reminderMinute ?? 30));
   const [labelsInput, setLabelsInput] = useState((config?.defaultLabels || []).join(', '));
 
+  useEffect(() => {
+    setLockHour(String(config?.lockHour ?? 23));
+    setLockMinute(String(config?.lockMinute ?? 59));
+    setReminderHour(String(config?.reminderHour ?? 17));
+    setReminderMinute(String(config?.reminderMinute ?? 30));
+    setLabelsInput((config?.defaultLabels || []).join(', '));
+  }, [config]);
+
   // Backup / Import / Wipe state
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [exporting, setExporting] = useState(false);
@@ -113,6 +139,37 @@ export function AdminView({
   const [wipeModalOpen, setWipeModalOpen] = useState(false);
   const [wipeConfirmText, setWipeConfirmText] = useState('');
   const [wiping, setWiping] = useState(false);
+
+  // Google (Gmail) Database Admin access state (ignores internal @dama2.app auth accounts)
+  const [dbAuthUser, setDbAuthUser] = useState<GoogleDbAdminUser | null>(() => {
+    const u = auth.currentUser;
+    if (!u || !u.email || isInternalAuthEmail(u.email)) return null;
+    return {
+      uid: u.uid,
+      email: u.email.trim().toLowerCase(),
+      displayName: u.displayName || u.email,
+    };
+  });
+  const [dbAuthLoading, setDbAuthLoading] = useState(false);
+  const [dbAuthError, setDbAuthError] = useState('');
+
+  useEffect(() => {
+    const unsub = onAuthStateChanged(auth, (u) => {
+      if (u && u.email && !isInternalAuthEmail(u.email)) {
+        setDbAuthUser({
+          uid: u.uid,
+          email: u.email.trim().toLowerCase(),
+          displayName: u.displayName || u.email,
+        });
+      } else {
+        setDbAuthUser(null);
+      }
+    });
+    return () => unsub();
+  }, []);
+
+  const isDbAdminUnlocked =
+    Boolean(dbAuthUser) && dbAuthUser?.email === DAMA2_SUPER_ADMIN_EMAIL;
 
   function openCreateUser() {
     setEditingUser(null);
@@ -147,13 +204,13 @@ export function AdminView({
     setUserModalOpen(true);
   }
 
-  function openResetModal(u: UserProfile) {
-    setResetTargetUser(u);
-    setResetUsername(u.username || u.employeeCode.toLowerCase().replace(/[^a-z0-9]/g, ''));
-    setResetPassword('');
-    setResetConfirm('');
-    setResetMustChange(true);
-    setResetError('');
+  function openActivateModal(u: UserProfile) {
+    setActivateTargetUser(u);
+    setActivateUsername(u.username || u.employeeCode.toLowerCase().replace(/[^a-z0-9]/g, ''));
+    setActivatePassword('');
+    setActivateConfirm('');
+    setActivateMustChange(true);
+    setActivateError('');
   }
 
   function openCreateGroup() {
@@ -209,8 +266,8 @@ export function AdminView({
       setUserModalOpen(false);
       onNotify(
         editingUser
-          ? 'Đã cập nhật hồ sơ nhân sự.'
-          : 'Đã tạo tài khoản mới (người dùng sẽ phải đổi mật khẩu ở lần đăng nhập đầu).'
+          ? 'Đã cập nhật & mã hóa hồ sơ nhân sự.'
+          : 'Đã tạo tài khoản Firebase Auth mới (người dùng sẽ phải đổi mật khẩu ở lần đăng nhập đầu).'
       );
     } catch (err) {
       setUserModalError(err instanceof Error ? err.message : 'Không thể lưu tài khoản nhân sự.');
@@ -219,42 +276,46 @@ export function AdminView({
     }
   }
 
-  async function handleResetPasswordSubmit(e: React.FormEvent) {
+  async function handleActivateLegacyAuthSubmit(e: React.FormEvent) {
     e.preventDefault();
-    if (!resetTargetUser) return;
-    setResetError('');
-    if (resetPassword !== resetConfirm) {
-      setResetError('Mật khẩu xác nhận không khớp.');
+    if (!activateTargetUser) return;
+    setActivateError('');
+    if (activatePassword !== activateConfirm) {
+      setActivateError('Mật khẩu xác nhận không khớp.');
       return;
     }
-    setResetting(true);
+    setActivating(true);
     try {
-      await resetUserPasswordByAdmin({
-        targetUser: resetTargetUser,
-        usernameInput: resetUsername,
-        newPassword: resetPassword,
-        requireChangeOnNextLogin: resetMustChange,
+      await activateLegacyUserAuthByAdmin({
+        targetUser: activateTargetUser,
+        usernameInput: activateUsername,
+        initialPassword: activatePassword,
+        requireChangeOnNextLogin: activateMustChange,
         actor: currentUser,
         allUsers: users,
       });
-      setResetTargetUser(null);
-      onNotify(`Đã đặt lại mật khẩu cho ${resetTargetUser.fullName}.`);
+      setActivateTargetUser(null);
+      onNotify(`Đã kích hoạt Firebase Auth & mã hóa tài khoản cho ${activateTargetUser.fullName}.`);
     } catch (err) {
-      setResetError(err instanceof Error ? err.message : 'Không thể đặt lại mật khẩu.');
+      setActivateError(err instanceof Error ? err.message : 'Không thể kích hoạt tài khoản.');
     } finally {
-      setResetting(false);
+      setActivating(false);
     }
   }
 
   async function handleToggleLockUser(u: UserProfile) {
     if (!isAdmin || u.uid === currentUser.uid) return;
-    await toggleUserLockByAdmin({
-      targetUser: u,
-      nextActive: !u.isActive,
-      actor: currentUser,
-      allUsers: users,
-    });
-    onNotify(u.isActive ? `Đã khóa tài khoản ${u.fullName}.` : `Đã mở khóa ${u.fullName}.`);
+    try {
+      await toggleUserLockByAdmin({
+        targetUser: u,
+        nextActive: !u.isActive,
+        actor: currentUser,
+        allUsers: users,
+      });
+      onNotify(u.isActive ? `Đã khóa tài khoản ${u.fullName}.` : `Đã mở khóa ${u.fullName}.`);
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : 'Không thể thay đổi trạng thái khóa tài khoản.');
+    }
   }
 
   async function handleSaveGroup(e: React.FormEvent) {
@@ -362,6 +423,51 @@ export function AdminView({
     } finally {
       setWiping(false);
     }
+  }
+
+  async function handleGoogleDbSignIn() {
+    setDbAuthError('');
+    setDbAuthLoading(true);
+    onSetSyncSuspended?.(true);
+    try {
+      const gUser = await signInGoogleForDbAdmin();
+      if (gUser.email === DAMA2_SUPER_ADMIN_EMAIL) {
+        onSetSyncSuspended?.(false);
+        onNotify(
+          `Đã mở khóa quyền quản trị cơ sở dữ liệu DAMA2 cho ${maskEmail(gUser.email)}.`
+        );
+        return;
+      }
+
+      await signOutGoogleForDbAdmin();
+      onSetSyncSuspended?.(false);
+      onRequireRelogin?.(
+        `Tài khoản Google ${maskEmail(gUser.email)} không có quyền Quản trị Cơ sở dữ liệu DAMA2. Vui lòng đăng nhập lại bằng tài khoản nội bộ.`
+      );
+    } catch (err) {
+      onSetSyncSuspended?.(false);
+      const rawMsg = err instanceof Error ? err.message : String(err);
+      if (rawMsg.includes('popup-closed-by-user')) {
+        setDbAuthError('Bạn đã đóng cửa sổ đăng nhập Google trước khi hoàn tất.');
+      } else if (rawMsg.includes('unauthorized-domain')) {
+        setDbAuthError(
+          'Tên miền hiện tại chưa được cấp phép đăng nhập Google trong Firebase Authentication (Authorized domains).'
+        );
+      } else {
+        setDbAuthError(rawMsg || 'Không thể đăng nhập Google để quản trị cơ sở dữ liệu.');
+      }
+    } finally {
+      setDbAuthLoading(false);
+    }
+  }
+
+  async function handleSignOutGoogleDbAdmin() {
+    setDbAuthError('');
+    await signOutGoogleForDbAdmin();
+    onSetSyncSuspended?.(false);
+    onRequireRelogin?.(
+      'Đã đăng xuất tài khoản Google quản trị cơ sở dữ liệu. Vui lòng đăng nhập lại tài khoản nội bộ.'
+    );
   }
 
   return (
@@ -488,10 +594,18 @@ export function AdminView({
                       <td className="py-2.5 px-4 text-xs whitespace-nowrap">
                         <span
                           className={
-                            u.isActive ? 'text-emerald-700 font-medium' : 'text-red-700 font-medium'
+                            !u.isActive
+                              ? 'text-red-700 font-medium'
+                              : u.authUid
+                              ? 'text-emerald-700 font-medium'
+                              : 'text-amber-700 font-medium'
                           }
                         >
-                          {u.isActive ? 'Đang hoạt động' : 'Đã khóa'}
+                          {!u.isActive
+                            ? 'Đã khóa'
+                            : u.authUid
+                            ? 'Đang hoạt động'
+                            : 'Chưa kích hoạt Auth'}
                         </span>
                       </td>
                       {isAdmin && (
@@ -504,14 +618,16 @@ export function AdminView({
                             <Edit3 className="w-3.5 h-3.5" />
                             Sửa
                           </button>
-                          <button
-                            type="button"
-                            onClick={() => openResetModal(u)}
-                            className="inline-flex items-center gap-1 text-xs font-medium text-amber-700 hover:underline"
-                          >
-                            <KeyRound className="w-3.5 h-3.5" />
-                            Đặt lại MK
-                          </button>
+                          {!u.authUid && (
+                            <button
+                              type="button"
+                              onClick={() => openActivateModal(u)}
+                              className="inline-flex items-center gap-1 text-xs font-medium text-amber-700 hover:underline"
+                            >
+                              <KeyRound className="w-3.5 h-3.5" />
+                              Kích hoạt Auth
+                            </button>
+                          )}
                           {u.uid !== currentUser.uid && (
                             <button
                               type="button"
@@ -698,11 +814,95 @@ export function AdminView({
             </div>
           )}
 
+          {/* Google Database Admin Gate (DAMA2) */}
+          <div className="bg-white border border-slate-200 rounded-xl p-6 space-y-5">
+            <div className="flex flex-wrap items-start justify-between gap-4">
+              <div className="flex items-start gap-3">
+                <div className="w-9 h-9 rounded-lg bg-blue-50 text-blue-700 flex items-center justify-center shrink-0">
+                  <ShieldCheck className="w-5 h-5" />
+                </div>
+                <div className="space-y-1">
+                  <h3 className="text-sm font-semibold text-slate-900">
+                    Xác thực Gmail Quản trị Cơ sở dữ liệu DAMA2
+                  </h3>
+                  <p className="text-xs text-slate-600 leading-relaxed max-w-2xl">
+                    Chỉ tài khoản Google quản trị hệ thống của phòng ban DAMA2 mới có quyền mở khóa thao tác xuất/nhập Excel và xóa toàn bộ dữ liệu trên máy chủ Firestore.
+                  </p>
+                </div>
+              </div>
+
+              <div className="px-3.5 py-2 rounded-lg bg-slate-50 border border-slate-200 text-xs space-y-0.5 min-w-[220px]">
+                <div className="text-slate-500">Cơ sở dữ liệu phòng ban:</div>
+                <div className="font-semibold text-slate-900">Phòng Hành chính – Nghiệp vụ (DAMA2)</div>
+              </div>
+            </div>
+
+            {dbAuthError && (
+              <div className="p-3 rounded-lg bg-red-50 border border-red-200 text-xs text-red-700 leading-relaxed">
+                {dbAuthError}
+              </div>
+            )}
+
+            {isDbAdminUnlocked && dbAuthUser ? (
+              <div className="p-4 rounded-lg bg-emerald-50 border border-emerald-200 flex flex-wrap items-center justify-between gap-3">
+                <div className="flex items-start gap-2.5 text-xs text-emerald-950">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-700 shrink-0 mt-0.5" />
+                  <div className="space-y-0.5">
+                    <div>
+                      Đã mở khóa quyền quản trị CSDL bằng Gmail:{' '}
+                      <strong className="font-semibold">{maskEmail(dbAuthUser.email)}</strong>
+                    </div>
+                    <div className="text-emerald-800">
+                      Bạn đang có quyền xuất/nhập file Excel và quản trị dữ liệu hệ thống DAMA2.
+                    </div>
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={handleSignOutGoogleDbAdmin}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-red-700 bg-white border border-red-200 rounded-lg hover:bg-red-50"
+                  >
+                    <LogOut className="w-3.5 h-3.5" />
+                    Đăng xuất Gmail
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className="p-4 rounded-lg bg-amber-50 border border-amber-200 flex flex-wrap items-center justify-between gap-3">
+                <div className="flex items-start gap-2.5 text-xs text-amber-950 max-w-xl">
+                  <Lock className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
+                  <div className="space-y-1 leading-relaxed">
+                    <div className="font-semibold">
+                      Quyền quản trị cơ sở dữ liệu đang bị khóa
+                    </div>
+                    <div>
+                      Chỉ tài khoản Google quản trị hệ thống ({maskEmail(DAMA2_SUPER_ADMIN_EMAIL)}) mới được phép mở khóa tính năng xuất/nhập Excel và xóa toàn bộ dữ liệu của DAMA2.
+                    </div>
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    disabled={dbAuthLoading}
+                    onClick={handleGoogleDbSignIn}
+                    className="inline-flex items-center gap-2 px-4 py-2 text-xs font-medium text-white bg-blue-700 rounded-lg hover:bg-blue-800 disabled:opacity-50"
+                  >
+                    <Mail className="w-4 h-4" />
+                    {dbAuthLoading ? 'Đang xác thực Google...' : 'Đăng nhập bằng Google (Gmail)'}
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+
           {importResult && (
             <div className="p-4 rounded-xl bg-emerald-50 border border-emerald-200 text-xs text-emerald-900 space-y-1">
               <div className="font-semibold">Import Excel hoàn tất:</div>
               <div>
-                Nhân sự: <strong className="tabular-nums">{importResult.users}</strong> · Tài khoản:{' '}
+                Nhân sự: <strong className="tabular-nums">{importResult.users}</strong> · Tài khoản Auth mới cấp:{' '}
                 <strong className="tabular-nums">{importResult.credentials}</strong> · Nhóm:{' '}
                 <strong className="tabular-nums">{importResult.groups}</strong> · Dự án:{' '}
                 <strong className="tabular-nums">{importResult.projects}</strong> · Công việc:{' '}
@@ -716,11 +916,21 @@ export function AdminView({
                     · Bỏ qua {importResult.skippedLockedTasks} công việc đã khóa chỉnh sửa
                   </span>
                 )}
+                {importResult.skippedUsersNoAuth > 0 && (
+                  <span className="text-amber-800">
+                    {' '}
+                    · Bỏ qua {importResult.skippedUsersNoAuth} nhân sự chưa có mật khẩu khởi tạo (cột initialPassword)
+                  </span>
+                )}
               </div>
             </div>
           )}
 
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+          <div
+            className={`grid grid-cols-1 lg:grid-cols-2 gap-4 transition-opacity ${
+              isDbAdminUnlocked ? '' : 'opacity-60'
+            }`}
+          >
             {/* Export Excel */}
             <div className="bg-white border border-slate-200 rounded-xl p-6 space-y-4">
               <div className="flex items-start gap-3">
@@ -732,13 +942,13 @@ export function AdminView({
                     Tải toàn bộ cơ sở dữ liệu (.xlsx)
                   </h3>
                   <p className="text-xs text-slate-600 leading-relaxed">
-                    Xuất toàn bộ bảng nhân sự, tài khoản, nhóm việc, dự án, công việc, đầu việc con, bình luận, nhật ký làm việc, cấu hình và nhật ký hệ thống thành file Excel nhiều sheet.
+                    Giải mã và xuất toàn bộ bảng nhân sự, nhóm việc, dự án, công việc, đầu việc con, bình luận, nhật ký làm việc, cấu hình và nhật ký hệ thống thành file Excel nhiều sheet.
                   </p>
                 </div>
               </div>
               <button
                 type="button"
-                disabled={exporting}
+                disabled={!isDbAdminUnlocked || exporting}
                 onClick={handleExportExcel}
                 className="inline-flex items-center gap-2 px-4 py-2 text-xs font-medium text-white bg-blue-700 rounded-lg hover:bg-blue-800 disabled:opacity-50"
               >
@@ -758,7 +968,7 @@ export function AdminView({
                     Import cơ sở dữ liệu từ Excel (.xlsx)
                   </h3>
                   <p className="text-xs text-slate-600 leading-relaxed">
-                    Nạp lại dữ liệu từ file Excel đã xuất (hoặc chỉnh sửa theo đúng cấu trúc cột). Có thể điền cột <code className="font-mono bg-slate-100 px-1 rounded">initialPassword</code> ở sheet <code className="font-mono bg-slate-100 px-1 rounded">NhanSu</code> để cấp mật khẩu mới cho tài khoản.
+                    Nạp và tự động mã hóa lại dữ liệu từ file Excel. Với nhân sự mới, điền cột <code className="font-mono bg-slate-100 px-1 rounded">initialPassword</code> ở sheet <code className="font-mono bg-slate-100 px-1 rounded">NhanSu</code> để cấp tài khoản Firebase Auth.
                   </p>
                 </div>
               </div>
@@ -771,7 +981,7 @@ export function AdminView({
               />
               <button
                 type="button"
-                disabled={importing}
+                disabled={!isDbAdminUnlocked || importing}
                 onClick={() => fileInputRef.current?.click()}
                 className="inline-flex items-center gap-2 px-4 py-2 text-xs font-medium text-emerald-800 bg-emerald-50 border border-emerald-200 rounded-lg hover:bg-emerald-100 disabled:opacity-50"
               >
@@ -782,7 +992,11 @@ export function AdminView({
           </div>
 
           {/* Danger Zone: Wipe All Data */}
-          <div className="bg-white border border-red-200 rounded-xl p-6 space-y-4">
+          <div
+            className={`bg-white border border-red-200 rounded-xl p-6 space-y-4 transition-opacity ${
+              isDbAdminUnlocked ? '' : 'opacity-60'
+            }`}
+          >
             <div className="flex items-start gap-3">
               <div className="w-9 h-9 rounded-lg bg-red-50 text-red-700 flex items-center justify-center shrink-0">
                 <AlertTriangle className="w-5 h-5" />
@@ -798,12 +1012,13 @@ export function AdminView({
             </div>
             <button
               type="button"
+              disabled={!isDbAdminUnlocked}
               onClick={() => {
                 setWipeConfirmText('');
                 setDataError('');
                 setWipeModalOpen(true);
               }}
-              className="inline-flex items-center gap-2 px-4 py-2 text-xs font-medium text-white bg-red-700 rounded-lg hover:bg-red-800"
+              className="inline-flex items-center gap-2 px-4 py-2 text-xs font-medium text-white bg-red-700 rounded-lg hover:bg-red-800 disabled:opacity-50"
             >
               <Trash2 className="w-4 h-4" />
               Xóa toàn bộ dữ liệu...
@@ -891,15 +1106,15 @@ export function AdminView({
                   </label>
                   <input
                     type="text"
-                    required={!editingUser}
-                    disabled={Boolean(editingUser?.username)}
+                    required={!editingUser || !editingUser.authUid}
+                    disabled={Boolean(editingUser?.username && editingUser?.authUid)}
                     value={uUsername}
                     onChange={(e) => setUUsername(e.target.value.toLowerCase())}
                     placeholder="vd: nguyen_an"
                     className="w-full px-3 py-2 text-sm font-mono border border-slate-300 rounded-lg disabled:bg-slate-100 disabled:text-slate-500"
                   />
                 </div>
-                {!editingUser ? (
+                {!editingUser || !editingUser.authUid ? (
                   <div>
                     <label className="block text-xs font-medium text-slate-700 mb-1">
                       Mật khẩu khởi tạo *
@@ -928,16 +1143,20 @@ export function AdminView({
                 )}
               </div>
 
-              {!editingUser && (
+              {(!editingUser || !editingUser.authUid) ? (
                 <p className="text-[11px] text-slate-500 -mt-2">
                   Mật khẩu phải gồm ít nhất 8 ký tự (chữ hoa, chữ thường, số và ký tự đặc biệt). Nhân sự sẽ bắt buộc đổi mật khẩu ở lần đăng nhập đầu tiên.
+                </p>
+              ) : (
+                <p className="text-[11px] text-slate-500 -mt-2">
+                  Tài khoản xác thực qua Firebase Authentication; nhân sự tự đổi mật khẩu cá nhân sau khi đăng nhập.
                 </p>
               )}
 
               <div className="grid grid-cols-2 gap-3">
                 <div>
                   <label className="block text-xs font-medium text-slate-700 mb-1">
-                    Email liên hệ (không dùng đăng nhập)
+                    Email liên hệ (mã hóa AES-256)
                   </label>
                   <input
                     type="email"
@@ -947,7 +1166,7 @@ export function AdminView({
                     className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg"
                   />
                 </div>
-                {!editingUser && (
+                {(!editingUser || !editingUser.authUid) && (
                   <div>
                     <label className="block text-xs font-medium text-slate-700 mb-1">
                       Chức danh
@@ -1049,30 +1268,30 @@ export function AdminView({
         </div>
       )}
 
-      {/* Reset Password Modal */}
-      {resetTargetUser && (
+      {/* Activate Firebase Auth Modal (legacy unlinked users only) */}
+      {activateTargetUser && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4">
           <div className="bg-white border border-slate-200 rounded-xl w-full max-w-md p-6 space-y-4">
             <div className="flex items-center justify-between">
               <h3 className="text-base font-semibold text-slate-900">
-                Đặt lại mật khẩu · {resetTargetUser.fullName}
+                Kích hoạt Firebase Auth · {activateTargetUser.fullName}
               </h3>
               <button
                 type="button"
-                onClick={() => setResetTargetUser(null)}
+                onClick={() => setActivateTargetUser(null)}
                 className="p-1 text-slate-400 hover:text-slate-700"
               >
                 <X className="w-5 h-5" />
               </button>
             </div>
 
-            {resetError && (
+            {activateError && (
               <div className="p-3 rounded-lg bg-red-50 border border-red-200 text-xs text-red-700">
-                {resetError}
+                {activateError}
               </div>
             )}
 
-            <form onSubmit={handleResetPasswordSubmit} className="space-y-3">
+            <form onSubmit={handleActivateLegacyAuthSubmit} className="space-y-3">
               <div>
                 <label className="block text-xs font-medium text-slate-700 mb-1">
                   Tên đăng nhập
@@ -1080,22 +1299,22 @@ export function AdminView({
                 <input
                   type="text"
                   required
-                  disabled={Boolean(resetTargetUser.username)}
-                  value={resetUsername}
-                  onChange={(e) => setResetUsername(e.target.value.toLowerCase())}
+                  disabled={Boolean(activateTargetUser.username)}
+                  value={activateUsername}
+                  onChange={(e) => setActivateUsername(e.target.value.toLowerCase())}
                   className="w-full px-3 py-2 text-sm font-mono border border-slate-300 rounded-lg disabled:bg-slate-100 disabled:text-slate-600"
                 />
               </div>
 
               <div>
                 <label className="block text-xs font-medium text-slate-700 mb-1">
-                  Mật khẩu mới
+                  Mật khẩu khởi tạo
                 </label>
                 <input
                   type="password"
                   required
-                  value={resetPassword}
-                  onChange={(e) => setResetPassword(e.target.value)}
+                  value={activatePassword}
+                  onChange={(e) => setActivatePassword(e.target.value)}
                   className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg"
                 />
                 <p className="mt-1 text-[11px] text-slate-500">
@@ -1105,13 +1324,13 @@ export function AdminView({
 
               <div>
                 <label className="block text-xs font-medium text-slate-700 mb-1">
-                  Nhập lại mật khẩu mới
+                  Nhập lại mật khẩu khởi tạo
                 </label>
                 <input
                   type="password"
                   required
-                  value={resetConfirm}
-                  onChange={(e) => setResetConfirm(e.target.value)}
+                  value={activateConfirm}
+                  onChange={(e) => setActivateConfirm(e.target.value)}
                   className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg"
                 />
               </div>
@@ -1119,26 +1338,26 @@ export function AdminView({
               <label className="flex items-center gap-2 text-xs text-slate-700 cursor-pointer pt-1">
                 <input
                   type="checkbox"
-                  checked={resetMustChange}
-                  onChange={(e) => setResetMustChange(e.target.checked)}
+                  checked={activateMustChange}
+                  onChange={(e) => setActivateMustChange(e.target.checked)}
                 />
-                <span>Bắt buộc đổi mật khẩu ở lần đăng nhập tiếp theo</span>
+                <span>Bắt buộc đổi mật khẩu ở lần đăng nhập đầu tiên</span>
               </label>
 
               <div className="flex justify-end gap-2 pt-3 border-t border-slate-200">
                 <button
                   type="button"
-                  onClick={() => setResetTargetUser(null)}
+                  onClick={() => setActivateTargetUser(null)}
                   className="px-3.5 py-2 text-xs font-medium text-slate-700 border border-slate-300 rounded-lg"
                 >
                   Hủy
                 </button>
                 <button
                   type="submit"
-                  disabled={resetting}
+                  disabled={activating}
                   className="px-3.5 py-2 text-xs font-medium text-white bg-blue-700 rounded-lg hover:bg-blue-800 disabled:opacity-50"
                 >
-                  {resetting ? 'Đang cập nhật...' : 'Xác nhận đặt lại'}
+                  {activating ? 'Đang kích hoạt...' : 'Xác nhận kích hoạt'}
                 </button>
               </div>
             </form>
@@ -1298,6 +1517,7 @@ export function AdminView({
           </div>
         </div>
       )}
+
     </div>
   );
 }

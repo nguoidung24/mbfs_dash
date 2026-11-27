@@ -6,18 +6,26 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
-    // Connection check endpoint (read-only)
+    // Connection check endpoint (read-only, contains no user data)
     match /test/connection {
       allow get: if true;
     }
 
     // --- Primitive Helpers ---
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
     function isValidId(id) {
       return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
     }
 
-    function isValidUsername(u) {
-      return u is string && u.size() >= 2 && u.size() <= 64 && u.matches('^[a-z0-9._\\-]+$');
+    function isValidSpaceId(spaceId) {
+      return spaceId == 'DAMA2';
+    }
+
+    function isListableSpaceId(spaceId) {
+      return spaceId == 'DAMA2';
     }
 
     function incoming() {
@@ -26,6 +34,29 @@ service cloud.firestore {
 
     function existing() {
       return resource.data;
+    }
+
+    function defaultAdminUid(spaceId) {
+      return spaceId == 'DAMA2' ? 'usr_mbfs_admin' : 'usr_mbfs_admin';
+    }
+
+    function bootstrapAdminAuthEmail(spaceId) {
+      return spaceId == 'DAMA2' ? 'mbfs_admin@dama2.app' : 'mbfs_admin@dama2.app';
+    }
+
+    function isBootstrapAdminCaller(spaceId) {
+      return isSignedIn() && request.auth.token.email == bootstrapAdminAuthEmail(spaceId);
+    }
+
+    // Hardcoded Super Admin Google email for DAMA2
+    function isDefaultSpaceSuperAdmin() {
+      return isSignedIn() &&
+        request.auth.token.email_verified == true &&
+        request.auth.token.email == 'dungtamtithoi24@gmail.com';
+    }
+
+    function isSpaceSuperAdmin(spaceId) {
+      return spaceId == 'DAMA2' && isDefaultSpaceSuperAdmin();
     }
 
     function userDoc(uid) {
@@ -37,7 +68,11 @@ service cloud.firestore {
     }
 
     function isActiveUser(uid) {
-      return userExists(uid) && userDoc(uid).data.isActive == true && userDoc(uid).data.departmentId == 'DAMA2';
+      return userExists(uid) && userDoc(uid).data.isActive == true && isValidSpaceId(userDoc(uid).data.departmentId);
+    }
+
+    function isActiveUserInSpace(uid, spaceId) {
+      return isActiveUser(uid) && userDoc(uid).data.departmentId == spaceId;
     }
 
     function userHasRole(uid, role) {
@@ -50,6 +85,40 @@ service cloud.firestore {
 
     function isLeadershipUser(uid) {
       return isAdminUser(uid) || userHasRole(uid, 'TRUONG_PHONG') || userHasRole(uid, 'PHO_PHONG');
+    }
+
+    // Firebase Auth UID -> internal UserProfile binding check
+    function hasAuthBinding() {
+      return isSignedIn() && exists(/databases/$(database)/documents/authBindings/$(request.auth.uid));
+    }
+
+    function authBinding() {
+      return get(/databases/$(database)/documents/authBindings/$(request.auth.uid));
+    }
+
+    function isBoundUserInSpace(spaceId) {
+      return hasAuthBinding() &&
+        authBinding().data.departmentId == spaceId &&
+        authBinding().data.isActive == true &&
+        isActiveUserInSpace(authBinding().data.userId, spaceId);
+    }
+
+    function isBoundSelf(userId) {
+      return hasAuthBinding() &&
+        authBinding().data.userId == userId &&
+        authBinding().data.isActive == true;
+    }
+
+    function isSpaceMember(spaceId) {
+      return isSpaceSuperAdmin(spaceId) || isBoundUserInSpace(spaceId);
+    }
+
+    function isSpaceAdmin(spaceId) {
+      return isSpaceSuperAdmin(spaceId) || (isBoundUserInSpace(spaceId) && isAdminUser(authBinding().data.userId));
+    }
+
+    function isSpaceLeadership(spaceId) {
+      return isSpaceSuperAdmin(spaceId) || (isBoundUserInSpace(spaceId) && isLeadershipUser(authBinding().data.userId));
     }
 
     // Vietnam Time (UTC+7) helpers for WorkLog date lock
@@ -75,6 +144,27 @@ service cloud.firestore {
     }
 
     // --- Validation Blueprints ---
+
+    function isValidSpaceKey(data) {
+      return data.keys().hasAll(['spaceId', 'keyBase64', 'alg', 'createdAt']) &&
+        data.keys().hasOnly(['spaceId', 'keyBase64', 'alg', 'createdAt']) &&
+        isValidSpaceId(data.spaceId) &&
+        data.keyBase64 is string && data.keyBase64.size() >= 32 && data.keyBase64.size() <= 128 &&
+        data.alg == 'AES-256-GCM' &&
+        data.createdAt is timestamp;
+    }
+
+    function isValidAuthBinding(data) {
+      return data.keys().hasAll(['authUid', 'userId', 'departmentId', 'isActive', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['authUid', 'userId', 'departmentId', 'isActive', 'createdAt', 'updatedAt']) &&
+        isValidId(data.authUid) &&
+        isValidId(data.userId) &&
+        isValidSpaceId(data.departmentId) &&
+        data.isActive is bool &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
     function isValidRolesList(roles) {
       return roles is list &&
         roles.size() >= 1 &&
@@ -83,45 +173,26 @@ service cloud.firestore {
     }
 
     function isValidUserProfile(data) {
-      return data.keys().hasAll(['uid', 'employeeCode', 'fullName', 'roles', 'isActive', 'departmentId', 'createdAt', 'updatedAt']) &&
-        data.keys().hasOnly(['uid', 'username', 'authUid', 'employeeCode', 'fullName', 'title', 'roles', 'groupId', 'managerId', 'isActive', 'departmentId', 'createdAt', 'updatedAt']) &&
+      return data.keys().hasAll(['uid', 'authUid', 'encryptedAccount', 'mustChangePassword', 'roles', 'isActive', 'departmentId', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['uid', 'authUid', 'encryptedAccount', 'mustChangePassword', 'roles', 'groupId', 'managerId', 'isActive', 'departmentId', 'createdAt', 'updatedAt']) &&
         isValidId(data.uid) &&
-        (!('username' in data) || isValidUsername(data.username)) &&
-        (!('authUid' in data) || (data.authUid is string && data.authUid.size() <= 128)) &&
-        data.employeeCode is string && data.employeeCode.size() >= 1 && data.employeeCode.size() <= 32 &&
-        data.fullName is string && data.fullName.size() >= 1 && data.fullName.size() <= 120 &&
-        (!('title' in data) || (data.title is string && data.title.size() <= 120)) &&
+        isValidId(data.authUid) &&
+        data.encryptedAccount is string && data.encryptedAccount.size() >= 24 && data.encryptedAccount.size() <= 4096 && data.encryptedAccount.matches('^aes256gcm\\$.*') &&
+        data.mustChangePassword is bool &&
         isValidRolesList(data.roles) &&
         (!('groupId' in data) || (data.groupId is string && data.groupId.size() <= 64)) &&
         (!('managerId' in data) || (data.managerId is string && data.managerId.size() <= 128)) &&
         data.isActive is bool &&
-        data.departmentId == 'DAMA2' &&
-        data.createdAt is timestamp &&
-        data.updatedAt is timestamp;
-    }
-
-    function isValidAuthCredential(data) {
-      return data.keys().hasAll(['username', 'userId', 'passwordHash', 'mustChangePassword', 'isActive', 'failedAttempts', 'departmentId', 'createdAt', 'updatedAt']) &&
-        data.keys().hasOnly(['username', 'userId', 'passwordHash', 'mustChangePassword', 'isActive', 'failedAttempts', 'lockedUntil', 'departmentId', 'createdAt', 'updatedAt']) &&
-        isValidUsername(data.username) &&
-        isValidId(data.userId) &&
-        data.passwordHash is string && data.passwordHash.size() >= 20 && data.passwordHash.size() <= 256 &&
-        data.mustChangePassword is bool &&
-        data.isActive is bool &&
-        data.failedAttempts is int && data.failedAttempts >= 0 && data.failedAttempts <= 100 &&
-        (!('lockedUntil' in data) || (data.lockedUntil is number && data.lockedUntil >= 0)) &&
-        data.departmentId == 'DAMA2' &&
+        isValidSpaceId(data.departmentId) &&
         data.createdAt is timestamp &&
         data.updatedAt is timestamp;
     }
 
     function isValidUserPrivate(data) {
-      return data.keys().hasAll(['uid', 'email', 'updatedAt']) &&
-        data.keys().hasOnly(['uid', 'authUid', 'email', 'phone', 'updatedAt']) &&
+      return data.keys().hasAll(['uid', 'encryptedPrivate', 'updatedAt']) &&
+        data.keys().hasOnly(['uid', 'encryptedPrivate', 'updatedAt']) &&
         isValidId(data.uid) &&
-        (!('authUid' in data) || (data.authUid is string && data.authUid.size() <= 128)) &&
-        data.email is string && data.email.size() <= 160 &&
-        (!('phone' in data) || (data.phone is string && data.phone.size() <= 32)) &&
+        data.encryptedPrivate is string && data.encryptedPrivate.size() >= 24 && data.encryptedPrivate.size() <= 2048 && data.encryptedPrivate.matches('^aes256gcm\\$.*') &&
         data.updatedAt is timestamp;
     }
 
@@ -135,7 +206,7 @@ service cloud.firestore {
         data.leaderId is string && data.leaderId.size() <= 128 &&
         data.memberUids is list && data.memberUids.size() <= 50 &&
         (data.memberUids.size() == 0 || data.memberUids[0] is string) &&
-        data.departmentId == 'DAMA2' &&
+        isValidSpaceId(data.departmentId) &&
         data.createdAt is timestamp &&
         data.updatedAt is timestamp;
     }
@@ -154,7 +225,7 @@ service cloud.firestore {
         data.memberIds is list && data.memberIds.size() >= 1 && data.memberIds.size() <= 50 && data.memberIds[0] is string &&
         (!('labels' in data) || (data.labels is list && data.labels.size() <= 15 && (data.labels.size() == 0 || data.labels[0] is string))) &&
         isValidId(data.createdBy) &&
-        data.departmentId == 'DAMA2' &&
+        isValidSpaceId(data.departmentId) &&
         data.createdAt is timestamp &&
         data.updatedAt is timestamp;
     }
@@ -203,7 +274,7 @@ service cloud.firestore {
         (!('reviewNote' in data) || (data.reviewNote is string && data.reviewNote.size() <= 1000)) &&
         data.isLocked is bool &&
         data.participantIds is list && data.participantIds.size() >= 1 && data.participantIds.size() <= 50 && data.participantIds[0] is string &&
-        data.departmentId == 'DAMA2' &&
+        isValidSpaceId(data.departmentId) &&
         data.createdAt is timestamp &&
         data.updatedAt is timestamp;
     }
@@ -256,7 +327,7 @@ service cloud.firestore {
         (!('progressPercent' in data) || (data.progressPercent is number && data.progressPercent >= 0 && data.progressPercent <= 100)) &&
         data.note is string && data.note.size() >= 1 && data.note.size() <= 1000 &&
         data.viewerIds is list && data.viewerIds.size() >= 1 && data.viewerIds.size() <= 30 && data.viewerIds[0] is string &&
-        data.departmentId == 'DAMA2' &&
+        isValidSpaceId(data.departmentId) &&
         data.createdAt is timestamp &&
         data.updatedAt is timestamp;
     }
@@ -270,13 +341,13 @@ service cloud.firestore {
         data.id == (data.userId + '_' + data.workDate) &&
         isLeadershipUser(data.unlockedBy) &&
         data.reason is string && data.reason.size() >= 3 && data.reason.size() <= 500 &&
-        data.departmentId == 'DAMA2' &&
+        isValidSpaceId(data.departmentId) &&
         data.unlockedAt is timestamp;
     }
 
     function isValidSystemConfig(data) {
       return data.keys().hasAll(['lockHour', 'lockMinute', 'reminderHour', 'reminderMinute', 'timezone', 'defaultLabels', 'updatedAt']) &&
-        data.keys().hasOnly(['lockHour', 'lockMinute', 'reminderHour', 'reminderMinute', 'timezone', 'defaultLabels', 'holidays', 'updatedBy', 'updatedAt']) &&
+        data.keys().hasOnly(['lockHour', 'lockMinute', 'reminderHour', 'reminderMinute', 'timezone', 'defaultLabels', 'holidays', 'departmentId', 'updatedBy', 'updatedAt']) &&
         data.lockHour is int && data.lockHour >= 0 && data.lockHour <= 23 &&
         data.lockMinute is int && data.lockMinute >= 0 && data.lockMinute <= 59 &&
         data.reminderHour is int && data.reminderHour >= 0 && data.reminderHour <= 23 &&
@@ -284,6 +355,7 @@ service cloud.firestore {
         data.timezone is string && data.timezone.size() <= 40 &&
         data.defaultLabels is list && data.defaultLabels.size() <= 30 && (data.defaultLabels.size() == 0 || data.defaultLabels[0] is string) &&
         (!('holidays' in data) || (data.holidays is list && data.holidays.size() <= 50 && (data.holidays.size() == 0 || data.holidays[0] is string))) &&
+        (!('departmentId' in data) || isValidSpaceId(data.departmentId)) &&
         (!('updatedBy' in data) || (data.updatedBy is string && data.updatedBy.size() <= 128)) &&
         data.updatedAt is timestamp;
     }
@@ -299,124 +371,262 @@ service cloud.firestore {
         data.targetId is string && data.targetId.size() >= 1 && data.targetId.size() <= 128 &&
         data.detail is string && data.detail.size() >= 1 && data.detail.size() <= 1000 &&
         data.viewerIds is list && data.viewerIds.size() >= 1 && data.viewerIds.size() <= 30 && data.viewerIds[0] is string &&
-        data.departmentId == 'DAMA2' &&
+        isValidSpaceId(data.departmentId) &&
         data.createdAt is timestamp;
     }
 
     // --- Collection Rules ---
 
-    // Internal Auth Credentials (PBKDF2 salted hashes, NEVER allow list)
-    match /authCredentials/{username} {
-      allow get: if isValidUsername(username);
-      allow create: if isValidUsername(username) &&
-        isValidAuthCredential(incoming()) &&
-        incoming().username == username &&
+    // 1. Legacy gmailDatabases disabled (DAMA2 single-department mode)
+    match /gmailDatabases/{ownerUid} {
+      allow read, write: if false;
+    }
+
+    // 2. Per-Space AES-256-GCM Encryption Keys (NEVER allow list; get strictly for verified space members/super-admin)
+    match /spaceKeys/{spaceId} {
+      allow get: if isValidSpaceId(spaceId) && isSignedIn() && (
+        isSpaceMember(spaceId) ||
+        (
+          isBootstrapAdminCaller(spaceId) &&
+          (
+            !exists(/databases/$(database)/documents/users/$(defaultAdminUid(spaceId))) ||
+            !('authUid' in get(/databases/$(database)/documents/users/$(defaultAdminUid(spaceId))).data)
+          )
+        )
+      );
+      allow list: if false;
+      allow create: if isValidSpaceId(spaceId) && isSignedIn() &&
+        isValidSpaceKey(incoming()) &&
+        incoming().spaceId == spaceId &&
+        incoming().createdAt == request.time && (
+          isSpaceSuperAdmin(spaceId) ||
+          (
+            isBootstrapAdminCaller(spaceId) &&
+            (
+              !exists(/databases/$(database)/documents/users/$(defaultAdminUid(spaceId))) ||
+              !('authUid' in get(/databases/$(database)/documents/users/$(defaultAdminUid(spaceId))).data)
+            )
+          )
+        );
+      allow update, delete: if false;
+    }
+
+    // 3. Firebase Auth UID -> UserProfile Bindings (NEVER allow list)
+    match /authBindings/{authUid} {
+      allow get: if isValidId(authUid) && isSignedIn() && (
+        request.auth.uid == authUid ||
+        (resource != null && isSpaceAdmin(existing().departmentId))
+      );
+      allow list: if false;
+      allow create: if isValidId(authUid) && isSignedIn() &&
+        isValidAuthBinding(incoming()) &&
+        incoming().authUid == authUid &&
         incoming().createdAt == request.time &&
         incoming().updatedAt == request.time && (
-          username == 'mbfs_admin' ||
-          userExists(incoming().userId)
+          isSpaceAdmin(incoming().departmentId) ||
+          (
+            authUid == request.auth.uid &&
+            incoming().userId == defaultAdminUid(incoming().departmentId) &&
+            isBootstrapAdminCaller(incoming().departmentId) &&
+            exists(/databases/$(database)/documents/users/$(incoming().userId)) &&
+            get(/databases/$(database)/documents/users/$(incoming().userId)).data.authUid == request.auth.uid
+          )
         );
-      allow update: if isValidUsername(username) &&
-        isValidAuthCredential(incoming()) &&
-        incoming().username == existing().username &&
+      allow update: if isValidId(authUid) && isSignedIn() &&
+        isValidAuthBinding(incoming()) &&
+        incoming().authUid == existing().authUid &&
         incoming().userId == existing().userId &&
         incoming().departmentId == existing().departmentId &&
         incoming().createdAt == existing().createdAt &&
-        incoming().updatedAt == request.time && (
-          incoming().diff(existing()).affectedKeys().hasOnly(['passwordHash', 'mustChangePassword', 'failedAttempts', 'lockedUntil', 'isActive', 'updatedAt'])
-        );
-      allow delete: if isValidUsername(username) && username != 'mbfs_admin';
+        incoming().updatedAt == request.time &&
+        isSpaceAdmin(existing().departmentId);
+      allow delete: if isValidId(authUid) && isSignedIn() &&
+        existing().userId != defaultAdminUid(existing().departmentId) &&
+        isSpaceSuperAdmin(existing().departmentId);
     }
 
-    // Users (non-PII org directory)
-    match /users/{userId} {
-      allow get: if isValidId(userId) && (resource == null || resource.data.departmentId == 'DAMA2');
-      allow list: if resource.data.departmentId == 'DAMA2';
+    // 4. Legacy authCredentials (read/write disabled; super-admin delete only for cleanup)
+    match /authCredentials/{credId} {
+      allow read, create, update: if false;
+      allow delete: if isSignedIn() && resource != null && isSpaceSuperAdmin(existing().departmentId);
+    }
 
-      allow create: if isValidId(userId) &&
+    // 5. Users (Account PII encrypted in encryptedAccount; zero unauthenticated reads)
+    match /users/{userId} {
+      allow get: if isValidId(userId) && isSignedIn() && (
+        (resource == null && (hasAuthBinding() || isDefaultSpaceSuperAdmin())) ||
+        (resource != null && isSpaceMember(existing().departmentId)) ||
+        (
+          userId == defaultAdminUid('DAMA2') &&
+          isBootstrapAdminCaller('DAMA2') &&
+          (resource == null || !('authUid' in existing()) || existing().authUid == '')
+        )
+      );
+      allow list: if isSignedIn() &&
+        isListableSpaceId(resource.data.departmentId) &&
+        isSpaceMember(resource.data.departmentId);
+
+      allow create: if isValidId(userId) && isSignedIn() &&
         isValidUserProfile(incoming()) &&
         incoming().createdAt == request.time &&
-        incoming().updatedAt == request.time;
+        incoming().updatedAt == request.time && (
+          isSpaceAdmin(incoming().departmentId) ||
+          (
+            userId == defaultAdminUid(incoming().departmentId) &&
+            isBootstrapAdminCaller(incoming().departmentId) &&
+            incoming().authUid == request.auth.uid &&
+            incoming().roles.size() == 1 &&
+            ('ADMIN' in incoming().roles) &&
+            incoming().isActive == true
+          )
+        );
 
-      allow update: if isValidId(userId) &&
+      allow update: if isValidId(userId) && isSignedIn() &&
         isValidUserProfile(incoming()) &&
         incoming().uid == existing().uid &&
         incoming().departmentId == existing().departmentId &&
         incoming().createdAt == existing().createdAt &&
-        incoming().updatedAt == request.time;
+        incoming().updatedAt == request.time && (
+          isSpaceAdmin(existing().departmentId) ||
+          (
+            isBoundSelf(userId) &&
+            incoming().authUid == existing().authUid &&
+            incoming().roles == existing().roles &&
+            incoming().isActive == existing().isActive &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['mustChangePassword', 'encryptedAccount', 'updatedAt'])
+          ) ||
+          (
+            userId == defaultAdminUid(existing().departmentId) &&
+            (!('authUid' in existing()) || existing().authUid == '') &&
+            isBootstrapAdminCaller(existing().departmentId) &&
+            incoming().authUid == request.auth.uid &&
+            incoming().roles == existing().roles &&
+            incoming().isActive == true
+          )
+        );
 
-      allow delete: if isValidId(userId) && userId != 'usr_mbfs_admin';
+      allow delete: if isValidId(userId) && isSignedIn() &&
+        userId != defaultAdminUid(existing().departmentId) &&
+        isSpaceSuperAdmin(existing().departmentId);
 
       match /private/{docId} {
-        allow get: if isValidId(userId) && isValidId(docId);
-        allow create: if isValidId(userId) && isValidId(docId) && isValidUserPrivate(incoming()) && incoming().updatedAt == request.time;
-        allow update: if isValidId(userId) && isValidId(docId) && isValidUserPrivate(incoming()) && incoming().uid == existing().uid && incoming().updatedAt == request.time;
-        allow delete: if isValidId(userId) && isValidId(docId);
+        allow get: if isValidId(userId) && isValidId(docId) && isSignedIn() && (
+          isBoundSelf(userId) ||
+          (userExists(userId) && isSpaceAdmin(userDoc(userId).data.departmentId))
+        );
+        allow create, update: if isValidId(userId) && isValidId(docId) && isSignedIn() &&
+          isValidUserPrivate(incoming()) &&
+          incoming().uid == userId &&
+          incoming().updatedAt == request.time &&
+          userExists(userId) &&
+          isSpaceAdmin(userDoc(userId).data.departmentId);
+        allow delete: if isValidId(userId) && isValidId(docId) && isSignedIn() &&
+          userExists(userId) &&
+          isSpaceSuperAdmin(userDoc(userId).data.departmentId);
       }
     }
 
-    // Work Groups (4 groups)
+    // 6. Work Groups
     match /groups/{groupId} {
-      allow get: if isValidId(groupId) && (resource == null || resource.data.departmentId == 'DAMA2');
-      allow list: if resource.data.departmentId == 'DAMA2';
+      allow get: if isValidId(groupId) && isSignedIn() && (
+        (resource == null && (hasAuthBinding() || isDefaultSpaceSuperAdmin())) ||
+        (resource != null && isSpaceMember(existing().departmentId))
+      );
+      allow list: if isSignedIn() &&
+        isListableSpaceId(resource.data.departmentId) &&
+        isSpaceMember(resource.data.departmentId);
 
-      allow create: if isValidId(groupId) && isValidGroup(incoming()) && incoming().createdAt == request.time && incoming().updatedAt == request.time;
-      allow update: if isValidId(groupId) && isValidGroup(incoming()) && incoming().id == existing().id && incoming().departmentId == existing().departmentId && incoming().createdAt == existing().createdAt && incoming().updatedAt == request.time;
-      allow delete: if isValidId(groupId);
+      allow create: if isValidId(groupId) && isSignedIn() &&
+        isValidGroup(incoming()) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        isSpaceAdmin(incoming().departmentId);
+      allow update: if isValidId(groupId) && isSignedIn() &&
+        isValidGroup(incoming()) &&
+        incoming().id == existing().id &&
+        incoming().departmentId == existing().departmentId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        isSpaceAdmin(existing().departmentId);
+      allow delete: if isValidId(groupId) && isSignedIn() && isSpaceSuperAdmin(existing().departmentId);
     }
 
-    // Projects
+    // 7. Projects
     match /projects/{projectId} {
-      allow get: if isValidId(projectId) && (resource == null || resource.data.departmentId == 'DAMA2');
-      allow list: if resource.data.departmentId == 'DAMA2';
+      allow get: if isValidId(projectId) && isSignedIn() && (
+        (resource == null && (hasAuthBinding() || isDefaultSpaceSuperAdmin())) ||
+        (resource != null && isSpaceMember(existing().departmentId))
+      );
+      allow list: if isSignedIn() &&
+        isListableSpaceId(resource.data.departmentId) &&
+        isSpaceMember(resource.data.departmentId);
 
-      allow create: if isValidId(projectId) &&
+      allow create: if isValidId(projectId) && isSignedIn() &&
         isValidProject(incoming()) &&
-        isActiveUser(incoming().createdBy) &&
+        isSpaceMember(incoming().departmentId) &&
+        isActiveUserInSpace(incoming().createdBy, incoming().departmentId) &&
+        (isSpaceSuperAdmin(incoming().departmentId) || incoming().createdBy == authBinding().data.userId) &&
         incoming().createdAt == request.time &&
         incoming().updatedAt == request.time;
 
-      allow update: if isValidId(projectId) &&
+      allow update: if isValidId(projectId) && isSignedIn() &&
         isValidProject(incoming()) &&
+        isSpaceMember(existing().departmentId) &&
         incoming().id == existing().id &&
         incoming().createdBy == existing().createdBy &&
         incoming().departmentId == existing().departmentId &&
         incoming().createdAt == existing().createdAt &&
         incoming().updatedAt == request.time;
 
-      allow delete: if isValidId(projectId);
+      allow delete: if isValidId(projectId) && isSignedIn() && isSpaceSuperAdmin(existing().departmentId);
 
       match /members/{memberId} {
-        allow get: if isValidId(projectId) && isValidId(memberId);
-        allow list: if isValidId(projectId) && get(/databases/$(database)/documents/projects/$(projectId)).data.departmentId == 'DAMA2';
-        allow create, update: if isValidId(projectId) && isValidId(memberId) && isValidProjectMember(incoming()) && incoming().joinedAt == request.time;
-        allow delete: if isValidId(projectId) && isValidId(memberId);
+        allow get: if isValidId(projectId) && isValidId(memberId) && isSignedIn() &&
+          exists(/databases/$(database)/documents/projects/$(projectId)) &&
+          isSpaceMember(get(/databases/$(database)/documents/projects/$(projectId)).data.departmentId);
+        allow list: if isValidId(projectId) && isSignedIn() &&
+          exists(/databases/$(database)/documents/projects/$(projectId)) &&
+          isSpaceMember(get(/databases/$(database)/documents/projects/$(projectId)).data.departmentId);
+        allow create, update: if isValidId(projectId) && isValidId(memberId) && isSignedIn() &&
+          isValidProjectMember(incoming()) &&
+          incoming().joinedAt == request.time &&
+          exists(/databases/$(database)/documents/projects/$(projectId)) &&
+          isSpaceMember(get(/databases/$(database)/documents/projects/$(projectId)).data.departmentId);
+        allow delete: if isValidId(projectId) && isValidId(memberId) && isSignedIn() &&
+          exists(/databases/$(database)/documents/projects/$(projectId)) &&
+          isSpaceSuperAdmin(get(/databases/$(database)/documents/projects/$(projectId)).data.departmentId);
       }
     }
 
-    // Tasks
+    // 8. Tasks
     match /tasks/{taskId} {
-      allow get: if isValidId(taskId) && (resource == null || resource.data.departmentId == 'DAMA2');
-      allow list: if resource.data.departmentId == 'DAMA2';
+      allow get: if isValidId(taskId) && isSignedIn() && (
+        (resource == null && (hasAuthBinding() || isDefaultSpaceSuperAdmin())) ||
+        (resource != null && isSpaceMember(existing().departmentId))
+      );
+      allow list: if isSignedIn() &&
+        isListableSpaceId(resource.data.departmentId) &&
+        isSpaceMember(resource.data.departmentId);
 
-      allow create: if isValidId(taskId) &&
+      allow create: if isValidId(taskId) && isSignedIn() &&
         isValidTask(incoming()) &&
-        isActiveUser(incoming().creatorId) &&
+        isSpaceMember(incoming().departmentId) &&
+        isActiveUserInSpace(incoming().creatorId, incoming().departmentId) &&
+        (isSpaceSuperAdmin(incoming().departmentId) || incoming().creatorId == authBinding().data.userId) &&
         incoming().createdAt == request.time &&
         incoming().updatedAt == request.time &&
         (!('projectId' in incoming()) || incoming().projectId == '' || exists(/databases/$(database)/documents/projects/$(incoming().projectId)));
 
-      allow update: if isValidId(taskId) &&
+      allow update: if isValidId(taskId) && isSignedIn() &&
         isValidTask(incoming()) &&
+        isSpaceMember(existing().departmentId) &&
         incoming().id == existing().id &&
         incoming().code == existing().code &&
         incoming().creatorId == existing().creatorId &&
         incoming().departmentId == existing().departmentId &&
         incoming().createdAt == existing().createdAt &&
         incoming().updatedAt == request.time && (
-          // When unlocked, valid updates are allowed
           existing().isLocked == false ||
-          // When locked (HOAN_THANH), only reopening with reviewNote >= 3 chars is allowed
           (
             existing().isLocked == true &&
             incoming().isLocked == false &&
@@ -428,46 +638,75 @@ service cloud.firestore {
           )
         );
 
-      allow delete: if isValidId(taskId);
+      allow delete: if isValidId(taskId) && isSignedIn() && isSpaceSuperAdmin(existing().departmentId);
 
       match /subtasks/{subtaskId} {
-        allow get: if isValidId(taskId) && isValidId(subtaskId);
-        allow list: if isValidId(taskId) && get(/databases/$(database)/documents/tasks/$(taskId)).data.departmentId == 'DAMA2';
-        allow create, update: if isValidId(taskId) && isValidId(subtaskId) && isValidSubtask(incoming());
-        allow delete: if isValidId(taskId) && isValidId(subtaskId);
+        allow get, list: if isValidId(taskId) && isSignedIn() &&
+          exists(/databases/$(database)/documents/tasks/$(taskId)) &&
+          isSpaceMember(get(/databases/$(database)/documents/tasks/$(taskId)).data.departmentId);
+        allow create, update: if isValidId(taskId) && isValidId(subtaskId) && isSignedIn() &&
+          isValidSubtask(incoming()) &&
+          exists(/databases/$(database)/documents/tasks/$(taskId)) &&
+          isSpaceMember(get(/databases/$(database)/documents/tasks/$(taskId)).data.departmentId);
+        allow delete: if isValidId(taskId) && isValidId(subtaskId) && isSignedIn() &&
+          exists(/databases/$(database)/documents/tasks/$(taskId)) &&
+          isSpaceSuperAdmin(get(/databases/$(database)/documents/tasks/$(taskId)).data.departmentId);
       }
 
       match /comments/{commentId} {
-        allow get: if isValidId(taskId) && isValidId(commentId);
-        allow list: if isValidId(taskId) && get(/databases/$(database)/documents/tasks/$(taskId)).data.departmentId == 'DAMA2';
-        allow create: if isValidId(taskId) && isValidId(commentId) && isValidComment(incoming()) && incoming().createdAt == request.time;
-        allow delete: if isValidId(taskId) && isValidId(commentId);
+        allow get, list: if isValidId(taskId) && isSignedIn() &&
+          exists(/databases/$(database)/documents/tasks/$(taskId)) &&
+          isSpaceMember(get(/databases/$(database)/documents/tasks/$(taskId)).data.departmentId);
+        allow create: if isValidId(taskId) && isValidId(commentId) && isSignedIn() &&
+          isValidComment(incoming()) &&
+          incoming().createdAt == request.time &&
+          exists(/databases/$(database)/documents/tasks/$(taskId)) &&
+          isSpaceMember(get(/databases/$(database)/documents/tasks/$(taskId)).data.departmentId);
+        allow delete: if isValidId(taskId) && isValidId(commentId) && isSignedIn() &&
+          exists(/databases/$(database)/documents/tasks/$(taskId)) &&
+          isSpaceSuperAdmin(get(/databases/$(database)/documents/tasks/$(taskId)).data.departmentId);
       }
 
       match /auditLogs/{logId} {
-        allow get: if isValidId(taskId) && isValidId(logId);
-        allow list: if isValidId(taskId) && get(/databases/$(database)/documents/tasks/$(taskId)).data.departmentId == 'DAMA2';
-        allow create: if isValidId(taskId) && isValidId(logId) && isValidTaskAuditLog(incoming()) && incoming().createdAt == request.time;
-        allow delete: if isValidId(taskId) && isValidId(logId);
+        allow get, list: if isValidId(taskId) && isSignedIn() &&
+          exists(/databases/$(database)/documents/tasks/$(taskId)) &&
+          isSpaceMember(get(/databases/$(database)/documents/tasks/$(taskId)).data.departmentId);
+        allow create: if isValidId(taskId) && isValidId(logId) && isSignedIn() &&
+          isValidTaskAuditLog(incoming()) &&
+          incoming().createdAt == request.time &&
+          exists(/databases/$(database)/documents/tasks/$(taskId)) &&
+          isSpaceMember(get(/databases/$(database)/documents/tasks/$(taskId)).data.departmentId);
+        allow delete: if isValidId(taskId) && isValidId(logId) && isSignedIn() &&
+          exists(/databases/$(database)/documents/tasks/$(taskId)) &&
+          isSpaceSuperAdmin(get(/databases/$(database)/documents/tasks/$(taskId)).data.departmentId);
       }
     }
 
-    // WorkLogs (enforces Vietnam UTC+7 date lock on server)
+    // 9. WorkLogs (enforces Vietnam UTC+7 date lock on server)
     match /workLogs/{logId} {
-      allow get: if isValidId(logId) && (resource == null || resource.data.departmentId == 'DAMA2');
-      allow list: if resource.data.departmentId == 'DAMA2';
+      allow get: if isValidId(logId) && isSignedIn() && (
+        (resource == null && (hasAuthBinding() || isDefaultSpaceSuperAdmin())) ||
+        (resource != null && isSpaceMember(existing().departmentId))
+      );
+      allow list: if isSignedIn() &&
+        isListableSpaceId(resource.data.departmentId) &&
+        isSpaceMember(resource.data.departmentId);
 
-      allow create: if isValidId(logId) &&
+      allow create: if isValidId(logId) && isSignedIn() &&
         isValidWorkLog(incoming()) &&
-        isActiveUser(incoming().userId) &&
+        isSpaceMember(incoming().departmentId) &&
+        isActiveUserInSpace(incoming().userId, incoming().departmentId) &&
+        (isSpaceSuperAdmin(incoming().departmentId) || incoming().userId == authBinding().data.userId) &&
         incoming().createdAt == request.time &&
         incoming().updatedAt == request.time &&
         exists(/databases/$(database)/documents/tasks/$(incoming().taskId)) &&
         isWorkLogDateEditable(incoming().userId, incoming().workDate, incoming().workDateNum);
 
-      allow update: if isValidId(logId) &&
+      allow update: if isValidId(logId) && isSignedIn() &&
         isValidWorkLog(incoming()) &&
+        isSpaceMember(existing().departmentId) &&
         isActiveUser(existing().userId) &&
+        (isSpaceSuperAdmin(existing().departmentId) || existing().userId == authBinding().data.userId) &&
         incoming().id == existing().id &&
         incoming().userId == existing().userId &&
         incoming().workDate == existing().workDate &&
@@ -477,36 +716,62 @@ service cloud.firestore {
         incoming().updatedAt == request.time &&
         isWorkLogDateEditable(existing().userId, existing().workDate, existing().workDateNum);
 
-      allow delete: if isValidId(logId) && (
-        (isActiveUser(existing().userId) && isWorkLogDateEditable(existing().userId, existing().workDate, existing().workDateNum)) ||
-        !exists(/databases/$(database)/documents/tasks/$(existing().taskId))
+      allow delete: if isValidId(logId) && isSignedIn() && (
+        (isSpaceMember(existing().departmentId) && isActiveUser(existing().userId) && (isSpaceSuperAdmin(existing().departmentId) || existing().userId == authBinding().data.userId) && isWorkLogDateEditable(existing().userId, existing().workDate, existing().workDateNum)) ||
+        isSpaceSuperAdmin(existing().departmentId)
       );
     }
 
-    // WorkLog Unlocks (Admin or Trưởng/Phó phòng only via isLeadershipUser check)
+    // 10. WorkLog Unlocks (Leadership/Admin only)
     match /workLogUnlocks/{unlockId} {
-      allow get: if isValidId(unlockId) && (resource == null || resource.data.departmentId == 'DAMA2');
-      allow list: if resource.data.departmentId == 'DAMA2';
-      allow create, update: if isValidId(unlockId) &&
+      allow get: if isValidId(unlockId) && isSignedIn() && (
+        (resource == null && (hasAuthBinding() || isDefaultSpaceSuperAdmin())) ||
+        (resource != null && isSpaceMember(existing().departmentId))
+      );
+      allow list: if isSignedIn() &&
+        isListableSpaceId(resource.data.departmentId) &&
+        isSpaceMember(resource.data.departmentId);
+      allow create, update: if isValidId(unlockId) && isSignedIn() &&
         isValidWorkLogUnlock(incoming()) &&
+        isSpaceLeadership(incoming().departmentId) &&
         unlockId == incoming().id &&
         incoming().unlockedAt == request.time;
-      allow delete: if isValidId(unlockId);
+      allow delete: if isValidId(unlockId) && isSignedIn() && isSpaceSuperAdmin(existing().departmentId);
     }
 
-    // System Configs
+    // 11. System Configs
     match /systemConfigs/{configId} {
-      allow get: if isValidId(configId);
-      allow create, update: if isValidId(configId) && isValidSystemConfig(incoming()) && incoming().updatedAt == request.time;
-      allow delete: if isValidId(configId);
+      allow get: if isValidId(configId) && isSignedIn() &&
+        isSpaceMember(configId == 'department' ? 'DAMA2' : configId);
+      allow create, update: if isValidId(configId) && isSignedIn() &&
+        isValidSystemConfig(incoming()) &&
+        incoming().updatedAt == request.time &&
+        (configId == 'department' || incoming().departmentId == configId) && (
+          isSpaceAdmin(configId == 'department' ? 'DAMA2' : configId) ||
+          (
+            !exists(/databases/$(database)/documents/systemConfigs/$(configId)) &&
+            isBootstrapAdminCaller(configId == 'department' ? 'DAMA2' : configId)
+          )
+        );
+      allow delete: if isValidId(configId) && isSignedIn() &&
+        isSpaceSuperAdmin(configId == 'department' ? 'DAMA2' : configId);
     }
 
-    // System Audit Logs
+    // 12. System Audit Logs
     match /auditLogs/{logId} {
-      allow get: if isValidId(logId) && (resource == null || resource.data.departmentId == 'DAMA2');
-      allow list: if resource.data.departmentId == 'DAMA2';
-      allow create: if isValidId(logId) && isValidAuditLog(incoming()) && incoming().createdAt == request.time;
-      allow delete: if isValidId(logId);
+      allow get: if isValidId(logId) && isSignedIn() && (
+        (resource == null && (hasAuthBinding() || isDefaultSpaceSuperAdmin())) ||
+        (resource != null && isSpaceMember(existing().departmentId))
+      );
+      allow list: if isSignedIn() &&
+        isListableSpaceId(resource.data.departmentId) &&
+        isSpaceMember(resource.data.departmentId);
+      allow create: if isValidId(logId) && isSignedIn() &&
+        isValidAuditLog(incoming()) &&
+        isSpaceMember(incoming().departmentId) &&
+        isActiveUserInSpace(incoming().actorId, incoming().departmentId) &&
+        incoming().createdAt == request.time;
+      allow delete: if isValidId(logId) && isSignedIn() && isSpaceSuperAdmin(existing().departmentId);
     }
   }
 }

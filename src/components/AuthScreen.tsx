@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import {
   AlertCircle,
   Building2,
+  CheckCircle2,
   Eye,
   EyeOff,
   KeyRound,
@@ -14,9 +15,13 @@ import { changeOwnPassword, loginWithUsernamePassword } from '../lib/firestoreSe
 
 interface AuthScreenProps {
   onAuthenticated: (result: { user: UserProfile; mustChangePassword: boolean }) => Promise<void> | void;
+  notice?: string;
 }
 
-export function AuthScreen({ onAuthenticated }: AuthScreenProps) {
+export function AuthScreen({
+  onAuthenticated,
+  notice,
+}: AuthScreenProps) {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
@@ -68,6 +73,13 @@ export function AuthScreen({ onAuthenticated }: AuthScreenProps) {
               Sử dụng tài khoản nội bộ do Quản trị viên cấp. Không hỗ trợ tự đăng ký.
             </p>
           </div>
+
+          {notice && (
+            <div className="flex items-start gap-2.5 p-3 rounded-lg bg-blue-50 border border-blue-200 text-xs text-blue-900 leading-relaxed">
+              <CheckCircle2 className="w-4 h-4 text-blue-700 shrink-0 mt-0.5" />
+              <span>{notice}</span>
+            </div>
+          )}
 
           {error && (
             <div className="flex items-start gap-2.5 p-3 rounded-lg bg-red-50 border border-red-200 text-xs text-red-800 leading-relaxed">

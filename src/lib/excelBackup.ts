@@ -1,8 +1,14 @@
 import * as XLSX from 'xlsx';
 import {
+  createUserWithEmailAndPassword,
+  signInWithEmailAndPassword,
+  signOut,
+} from 'firebase/auth';
+import {
   collection,
   doc,
   getDoc,
+  getDocFromServer,
   getDocs,
   query,
   serverTimestamp,
@@ -10,9 +16,7 @@ import {
   WriteBatch,
 } from 'firebase/firestore';
 import {
-  AuthCredential,
   DEFAULT_ADMIN_USERNAME,
-  DEPARTMENT_ID,
   Project,
   ProjectStatus,
   ReviewResult,
@@ -30,9 +34,23 @@ import {
   WorkLog,
   WorkLogUnlock,
 } from '../types/domain';
-import { hashPassword } from './cryptoAuth';
-import { db, handleFirestoreError, OperationType } from './firebase';
+import { validatePasswordStrength } from './cryptoAuth';
 import {
+  db,
+  getActiveSpaceId,
+  getInternalAuthEmail,
+  getSystemConfigDocId,
+  handleFirestoreError,
+  OperationType,
+  provisionerAuth,
+} from './firebase';
+import {
+  decodeUserProfiles,
+  decryptPrivateEmail,
+  encryptAccountData,
+  encryptPrivateData,
+  getOrInitSpaceAesKey,
+  getSpaceAesKey,
   isValidUsernameFormat,
   logSystemAudit,
   normalizeUsername,
@@ -106,7 +124,16 @@ function sanitizeDocId(raw: string, fallbackPrefix: string): string {
   return `${fallbackPrefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
 }
 
+function scopeIdForSpace(raw: string, fallbackPrefix: string, spaceId: string): string {
+  const cleaned = sanitizeDocId(raw, fallbackPrefix);
+  if (spaceId === 'DAMA2') return cleaned;
+  const stripped = cleaned.replace(/^DB_[a-zA-Z0-9_-]+__/, '');
+  return `${spaceId}__${stripped}`.slice(0, 128);
+}
+
 export async function exportDatabaseToExcel(actor: UserProfile): Promise<void> {
+  const spaceId = getActiveSpaceId();
+  const cfgId = getSystemConfigDocId();
   try {
     const [
       usersSnap,
@@ -118,28 +145,33 @@ export async function exportDatabaseToExcel(actor: UserProfile): Promise<void> {
       configSnap,
       auditLogsSnap,
     ] = await Promise.all([
-      getDocs(query(collection(db, 'users'), where('departmentId', '==', DEPARTMENT_ID))),
-      getDocs(query(collection(db, 'groups'), where('departmentId', '==', DEPARTMENT_ID))),
-      getDocs(query(collection(db, 'projects'), where('departmentId', '==', DEPARTMENT_ID))),
-      getDocs(query(collection(db, 'tasks'), where('departmentId', '==', DEPARTMENT_ID))),
-      getDocs(query(collection(db, 'workLogs'), where('departmentId', '==', DEPARTMENT_ID))),
-      getDocs(
-        query(collection(db, 'workLogUnlocks'), where('departmentId', '==', DEPARTMENT_ID))
-      ),
-      getDoc(doc(db, 'systemConfigs', 'department')),
-      getDocs(query(collection(db, 'auditLogs'), where('departmentId', '==', DEPARTMENT_ID))),
+      getDocs(query(collection(db, 'users'), where('departmentId', '==', spaceId))),
+      getDocs(query(collection(db, 'groups'), where('departmentId', '==', spaceId))),
+      getDocs(query(collection(db, 'projects'), where('departmentId', '==', spaceId))),
+      getDocs(query(collection(db, 'tasks'), where('departmentId', '==', spaceId))),
+      getDocs(query(collection(db, 'workLogs'), where('departmentId', '==', spaceId))),
+      getDocs(query(collection(db, 'workLogUnlocks'), where('departmentId', '==', spaceId))),
+      getDoc(doc(db, 'systemConfigs', cfgId)),
+      getDocs(query(collection(db, 'auditLogs'), where('departmentId', '==', spaceId))),
     ]);
 
-    const usersList = usersSnap.docs.map((d) => d.data() as UserProfile);
+    const spaceKey = await getSpaceAesKey(spaceId);
+    const usersList = await decodeUserProfiles(
+      usersSnap.docs.map((d) => d.data() as Record<string, unknown>),
+      spaceId
+    );
 
-    // Fetch private emails and authCredentials per user safely (allow get only, no list)
     const userRows = await Promise.all(
       usersList.map(async (u) => {
-        let email = '';
+        let email = u.email || '';
         try {
           const pSnap = await getDoc(doc(db, 'users', u.uid, 'private', 'info'));
           if (pSnap.exists()) {
-            email = (pSnap.data() as { email?: string }).email || '';
+            const privEmail = await decryptPrivateEmail(
+              pSnap.data() as Record<string, unknown>,
+              spaceKey
+            );
+            if (privEmail) email = privEmail;
           }
         } catch {
           // ignore
@@ -158,35 +190,6 @@ export async function exportDatabaseToExcel(actor: UserProfile): Promise<void> {
           initialPassword: '',
         };
       })
-    );
-
-    const credRows: Array<{
-      username: string;
-      userId: string;
-      passwordHash: string;
-      mustChangePassword: boolean;
-      isActive: boolean;
-    }> = [];
-    await Promise.all(
-      usersList
-        .filter((u) => u.username && isValidUsernameFormat(u.username))
-        .map(async (u) => {
-          try {
-            const cSnap = await getDoc(doc(db, 'authCredentials', u.username!));
-            if (cSnap.exists()) {
-              const c = cSnap.data() as AuthCredential;
-              credRows.push({
-                username: c.username,
-                userId: c.userId,
-                passwordHash: c.passwordHash,
-                mustChangePassword: c.mustChangePassword,
-                isActive: c.isActive,
-              });
-            }
-          } catch {
-            // ignore
-          }
-        })
     );
 
     const groupRows = groupsSnap.docs.map((d) => {
@@ -373,13 +376,6 @@ export async function exportDatabaseToExcel(actor: UserProfile): Promise<void> {
       'email',
       'initialPassword',
     ]);
-    appendSheet('TaiKhoan', credRows, [
-      'username',
-      'userId',
-      'passwordHash',
-      'mustChangePassword',
-      'isActive',
-    ]);
     appendSheet('NhomViec', groupRows, [
       'id',
       'code',
@@ -483,14 +479,14 @@ export async function exportDatabaseToExcel(actor: UserProfile): Promise<void> {
     ]);
 
     const { dateStr, hour, minute } = getVietnamNowParts();
-    const fileName = `DAMA2_CSDL_${dateStr}_${String(hour).padStart(2, '0')}${String(minute).padStart(2, '0')}.xlsx`;
+    const fileName = `${spaceId}_CSDL_${dateStr}_${String(hour).padStart(2, '0')}${String(minute).padStart(2, '0')}.xlsx`;
     XLSX.writeFile(wb, fileName);
 
     await logSystemAudit({
       actor,
       action: 'Xuất cơ sở dữ liệu Excel',
       targetType: 'system',
-      targetId: DEPARTMENT_ID,
+      targetId: spaceId,
       detail: `Tải xuống file ${fileName} (${userRows.length} nhân sự, ${projectRows.length} dự án, ${taskRows.length} công việc, ${workLogRows.length} log work)`,
       allUsers: usersList,
     });
@@ -502,6 +498,7 @@ export async function exportDatabaseToExcel(actor: UserProfile): Promise<void> {
 export interface ImportSummary {
   users: number;
   credentials: number;
+  skippedUsersNoAuth: number;
   groups: number;
   projects: number;
   tasks: number;
@@ -520,7 +517,6 @@ export async function importDatabaseFromExcel(
 
   const recognizedSheets = [
     'NhanSu',
-    'TaiKhoan',
     'NhomViec',
     'DuAn',
     'CongViec',
@@ -546,6 +542,7 @@ export async function importDatabaseFromExcel(
   const summary: ImportSummary = {
     users: 0,
     credentials: 0,
+    skippedUsersNoAuth: 0,
     groups: 0,
     projects: 0,
     tasks: 0,
@@ -555,18 +552,24 @@ export async function importDatabaseFromExcel(
     skippedLockedTasks: 0,
   };
 
+  const spaceId = getActiveSpaceId();
+  const cfgId = getSystemConfigDocId();
+  const spaceKey = await getOrInitSpaceAesKey(spaceId);
+
   // Preload current state to distinguish create vs update and preserve immutable createdAt
   const [existingUsersSnap, existingGroupsSnap, existingProjectsSnap, existingTasksSnap, existingWlSnap, existingUlSnap] =
     await Promise.all([
-      getDocs(query(collection(db, 'users'), where('departmentId', '==', DEPARTMENT_ID))),
-      getDocs(query(collection(db, 'groups'), where('departmentId', '==', DEPARTMENT_ID))),
-      getDocs(query(collection(db, 'projects'), where('departmentId', '==', DEPARTMENT_ID))),
-      getDocs(query(collection(db, 'tasks'), where('departmentId', '==', DEPARTMENT_ID))),
-      getDocs(query(collection(db, 'workLogs'), where('departmentId', '==', DEPARTMENT_ID))),
-      getDocs(query(collection(db, 'workLogUnlocks'), where('departmentId', '==', DEPARTMENT_ID))),
+      getDocs(query(collection(db, 'users'), where('departmentId', '==', spaceId))),
+      getDocs(query(collection(db, 'groups'), where('departmentId', '==', spaceId))),
+      getDocs(query(collection(db, 'projects'), where('departmentId', '==', spaceId))),
+      getDocs(query(collection(db, 'tasks'), where('departmentId', '==', spaceId))),
+      getDocs(query(collection(db, 'workLogs'), where('departmentId', '==', spaceId))),
+      getDocs(query(collection(db, 'workLogUnlocks'), where('departmentId', '==', spaceId))),
     ]);
 
-  const existingUsersMap = new Map(existingUsersSnap.docs.map((d) => [d.id, d.data() as UserProfile]));
+  const existingUsersMap = new Map(
+    existingUsersSnap.docs.map((d) => [d.id, d.data() as Record<string, unknown>])
+  );
   const existingGroupIds = new Set(existingGroupsSnap.docs.map((d) => d.id));
   const existingProjectsMap = new Map(existingProjectsSnap.docs.map((d) => [d.id, d.data() as Project]));
   const existingTasksMap = new Map(existingTasksSnap.docs.map((d) => [d.id, d.data() as TaskItem]));
@@ -575,23 +578,25 @@ export async function importDatabaseFromExcel(
 
   const activeUserIds = new Set<string>(
     existingUsersSnap.docs
-      .map((d) => d.data() as UserProfile)
-      .filter((u) => u.isActive)
-      .map((u) => u.uid)
+      .map((d) => d.data() as Record<string, unknown>)
+      .filter((u) => Boolean(u.isActive))
+      .map((u) => String(u.uid || ''))
+      .filter(Boolean)
   );
   activeUserIds.add(actor.uid);
 
   const importedUsersList: UserProfile[] = [];
 
-  // 1. NhanSu (Users)
+  // 1. NhanSu (Users - encrypted + Firebase Auth provisioned)
   const userRows = readSheet('NhanSu');
   const userOps: Array<(b: WriteBatch) => void> = [];
-  const pendingInitialPasswords: Array<{ username: string; userId: string; password: string; isActive: boolean }> = [];
+  const bindingOps: Array<(b: WriteBatch) => void> = [];
+  const privateOps: Array<(b: WriteBatch) => void> = [];
 
   for (const row of userRows) {
     const rawUid = str(row.uid, 128);
     if (!rawUid) continue;
-    const uid = sanitizeDocId(rawUid, 'usr');
+    const uid = scopeIdForSpace(rawUid, 'usr', spaceId);
     const rawUsername = normalizeUsername(str(row.username, 64));
     const username = rawUsername && isValidUsernameFormat(rawUsername) ? rawUsername : '';
     const employeeCode = str(row.employeeCode, 32) || uid.slice(0, 12);
@@ -607,42 +612,115 @@ export async function importDatabaseFromExcel(
       ? parsedRoles
       : ['CHUYEN_VIEN'];
     const isActive = isSelfAdmin ? true : parseBool(row.isActive, true);
-    const groupId = str(row.groupId, 64);
-    const managerId = str(row.managerId, 128);
+    const rawGroupId = str(row.groupId, 64);
+    const groupId = rawGroupId ? scopeIdForSpace(rawGroupId, 'grp', spaceId) : '';
+    const rawManagerId = str(row.managerId, 128);
+    const managerId = rawManagerId ? scopeIdForSpace(rawManagerId, 'usr', spaceId) : '';
     const email = str(row.email, 160).toLowerCase();
     const initialPassword = str(row.initialPassword, 128);
 
-    const existing = existingUsersMap.get(uid);
-    const userPayload: Record<string, unknown> = {
-      uid,
-      ...(username ? { username } : {}),
+    const existingRaw = existingUsersMap.get(uid);
+    let authUid =
+      existingRaw && typeof existingRaw.authUid === 'string' ? existingRaw.authUid : '';
+    let provisionedNow = false;
+
+    if (!authUid && username && initialPassword && !validatePasswordStrength(initialPassword)) {
+      const internalEmail = getInternalAuthEmail(username);
+      try {
+        const cred = await createUserWithEmailAndPassword(
+          provisionerAuth,
+          internalEmail,
+          initialPassword
+        );
+        authUid = cred.user.uid;
+        provisionedNow = true;
+      } catch (err) {
+        const code =
+          err && typeof err === 'object' && 'code' in err
+            ? String((err as { code?: unknown }).code || '')
+            : '';
+        if (code === 'auth/email-already-in-use') {
+          try {
+            const cred = await signInWithEmailAndPassword(
+              provisionerAuth,
+              internalEmail,
+              initialPassword
+            );
+            authUid = cred.user.uid;
+            provisionedNow = true;
+          } catch {
+            authUid = '';
+          }
+        }
+      } finally {
+        try {
+          await signOut(provisionerAuth);
+        } catch {
+          // ignore
+        }
+      }
+    }
+
+    if (!authUid) {
+      summary.skippedUsersNoAuth += 1;
+      continue;
+    }
+
+    const encryptedAccount = await encryptAccountData(spaceKey, {
+      username,
       employeeCode,
       fullName,
       title,
-      roles,
-      groupId,
-      managerId,
-      isActive,
-      departmentId: DEPARTMENT_ID,
-      updatedAt: serverTimestamp(),
-    };
+      email,
+    });
 
-    if (existing) {
-      userOps.push((b) => b.update(doc(db, 'users', uid), userPayload));
+    const mustChangePassword = provisionedNow
+      ? true
+      : Boolean(existingRaw?.mustChangePassword);
+
+    userOps.push((b) =>
+      b.set(doc(db, 'users', uid), {
+        uid,
+        authUid,
+        encryptedAccount,
+        mustChangePassword,
+        roles,
+        groupId,
+        managerId,
+        isActive,
+        departmentId: spaceId,
+        createdAt: existingRaw?.createdAt || serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      })
+    );
+
+    const bindingSnap = await getDocFromServer(doc(db, 'authBindings', authUid));
+    if (bindingSnap.exists()) {
+      bindingOps.push((b) =>
+        b.update(doc(db, 'authBindings', authUid), {
+          isActive,
+          updatedAt: serverTimestamp(),
+        })
+      );
     } else {
-      userOps.push((b) =>
-        b.set(doc(db, 'users', uid), {
-          ...userPayload,
+      bindingOps.push((b) =>
+        b.set(doc(db, 'authBindings', authUid), {
+          authUid,
+          userId: uid,
+          departmentId: spaceId,
+          isActive,
           createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
         })
       );
     }
 
     if (email) {
-      userOps.push((b) =>
+      const encryptedPrivate = await encryptPrivateData(spaceKey, { email });
+      privateOps.push((b) =>
         b.set(doc(db, 'users', uid, 'private', 'info'), {
           uid,
-          email,
+          encryptedPrivate,
           updatedAt: serverTimestamp(),
         })
       );
@@ -653,24 +731,23 @@ export async function importDatabaseFromExcel(
 
     importedUsersList.push({
       uid,
+      authUid,
+      encryptedAccount,
+      mustChangePassword,
       username,
       employeeCode,
       fullName,
       title,
+      email,
       roles,
       groupId,
       managerId,
       isActive,
-      departmentId: DEPARTMENT_ID,
+      departmentId: spaceId,
     });
 
-    if (username && initialPassword && !isSelfAdmin) {
-      pendingInitialPasswords.push({
-        username,
-        userId: uid,
-        password: initialPassword,
-        isActive,
-      });
+    if (provisionedNow) {
+      summary.credentials += 1;
     }
     summary.users += 1;
   }
@@ -678,107 +755,26 @@ export async function importDatabaseFromExcel(
   if (userOps.length > 0) {
     await runBatchOps(userOps);
   }
-
-  // 2. TaiKhoan (AuthCredentials) + any initialPassword from NhanSu
-  const credRows = readSheet('TaiKhoan');
-  const credOps: Array<(b: WriteBatch) => void> = [];
-  const handledUsernames = new Set<string>();
-
-  for (const item of pendingInitialPasswords) {
-    const hash = await hashPassword(item.password);
-    const cSnap = await getDoc(doc(db, 'authCredentials', item.username));
-    if (cSnap.exists()) {
-      credOps.push((b) =>
-        b.update(doc(db, 'authCredentials', item.username), {
-          passwordHash: hash,
-          mustChangePassword: true,
-          failedAttempts: 0,
-          lockedUntil: 0,
-          isActive: item.isActive,
-          updatedAt: serverTimestamp(),
-        })
-      );
-    } else {
-      credOps.push((b) =>
-        b.set(doc(db, 'authCredentials', item.username), {
-          username: item.username,
-          userId: item.userId,
-          passwordHash: hash,
-          mustChangePassword: true,
-          isActive: item.isActive,
-          failedAttempts: 0,
-          lockedUntil: 0,
-          departmentId: DEPARTMENT_ID,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        })
-      );
-    }
-    handledUsernames.add(item.username);
-    summary.credentials += 1;
+  if (bindingOps.length > 0) {
+    await runBatchOps(bindingOps);
   }
-
-  for (const row of credRows) {
-    const username = normalizeUsername(str(row.username, 64));
-    const userId = sanitizeDocId(str(row.userId, 128), 'usr');
-    const passwordHash = str(row.passwordHash, 256);
-    if (
-      !username ||
-      !isValidUsernameFormat(username) ||
-      handledUsernames.has(username) ||
-      username === actor.username ||
-      username === DEFAULT_ADMIN_USERNAME ||
-      !passwordHash.startsWith('pbkdf2_sha256$') ||
-      passwordHash.length < 20
-    ) {
-      continue;
-    }
-    const mustChangePassword = parseBool(row.mustChangePassword, true);
-    const isActive = parseBool(row.isActive, true);
-    const cSnap = await getDoc(doc(db, 'authCredentials', username));
-    if (cSnap.exists()) {
-      credOps.push((b) =>
-        b.update(doc(db, 'authCredentials', username), {
-          passwordHash,
-          mustChangePassword,
-          failedAttempts: 0,
-          lockedUntil: 0,
-          isActive,
-          updatedAt: serverTimestamp(),
-        })
-      );
-    } else {
-      credOps.push((b) =>
-        b.set(doc(db, 'authCredentials', username), {
-          username,
-          userId,
-          passwordHash,
-          mustChangePassword,
-          isActive,
-          failedAttempts: 0,
-          lockedUntil: 0,
-          departmentId: DEPARTMENT_ID,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        })
-      );
-    }
-    summary.credentials += 1;
-  }
-  if (credOps.length > 0) {
-    await runBatchOps(credOps);
+  if (privateOps.length > 0) {
+    await runBatchOps(privateOps);
   }
 
   // 3. NhomViec (Groups)
   const groupRows = readSheet('NhomViec');
   const groupOps: Array<(b: WriteBatch) => void> = [];
   for (const row of groupRows) {
-    const id = sanitizeDocId(str(row.id, 128), 'grp');
-    const code = str(row.code, 32) || id.toUpperCase();
+    const id = scopeIdForSpace(str(row.id, 128), 'grp', spaceId);
+    const code = str(row.code, 32) || id.toUpperCase().slice(0, 32);
     const name = str(row.name, 120) || code;
     const description = str(row.description, 500);
-    const leaderId = str(row.leaderId, 128);
-    const memberUids = splitList(row.memberUids).slice(0, 50);
+    const rawLeader = str(row.leaderId, 128);
+    const leaderId = rawLeader ? scopeIdForSpace(rawLeader, 'usr', spaceId) : '';
+    const memberUids = splitList(row.memberUids)
+      .slice(0, 50)
+      .map((u) => scopeIdForSpace(u, 'usr', spaceId));
 
     const payload = {
       id,
@@ -787,7 +783,7 @@ export async function importDatabaseFromExcel(
       description,
       leaderId,
       memberUids,
-      departmentId: DEPARTMENT_ID,
+      departmentId: spaceId,
       updatedAt: serverTimestamp(),
     };
     if (existingGroupIds.has(id)) {
@@ -812,8 +808,8 @@ export async function importDatabaseFromExcel(
   const projectIdsSet = new Set<string>(existingProjectsMap.keys());
 
   for (const row of projectRows) {
-    const id = sanitizeDocId(str(row.id, 128), 'prj');
-    const code = (str(row.code, 32) || id).toUpperCase();
+    const id = scopeIdForSpace(str(row.id, 128), 'prj', spaceId);
+    const code = (str(row.code, 32) || id).toUpperCase().slice(0, 32);
     const name = str(row.name, 160) || code;
     const description = str(row.description, 2000);
     const startDate = str(row.startDate, 20);
@@ -822,13 +818,15 @@ export async function importDatabaseFromExcel(
     const status: ProjectStatus = VALID_PROJECT_STATUSES.includes(rawStatus)
       ? rawStatus
       : 'DANG_THUC_HIEN';
-    const pmId = sanitizeDocId(str(row.pmId, 128) || actor.uid, 'usr');
+    const rawPm = str(row.pmId, 128);
+    const pmId = rawPm ? scopeIdForSpace(rawPm, 'usr', spaceId) : actor.uid;
     const memberIds = Array.from(
-      new Set([pmId, ...splitList(row.memberIds)])
+      new Set([pmId, ...splitList(row.memberIds).map((u) => scopeIdForSpace(u, 'usr', spaceId))])
     ).slice(0, 50);
     const labels = splitList(row.labels).slice(0, 15);
-    const rawCreator = sanitizeDocId(str(row.createdBy, 128) || actor.uid, 'usr');
-    const createdBy = activeUserIds.has(rawCreator) ? rawCreator : actor.uid;
+    const rawCreator = str(row.createdBy, 128);
+    const mappedCreator = rawCreator ? scopeIdForSpace(rawCreator, 'usr', spaceId) : actor.uid;
+    const createdBy = activeUserIds.has(mappedCreator) ? mappedCreator : actor.uid;
 
     const existing = existingProjectsMap.get(id);
     if (existing) {
@@ -860,7 +858,7 @@ export async function importDatabaseFromExcel(
           memberIds,
           labels,
           createdBy,
-          departmentId: DEPARTMENT_ID,
+          departmentId: spaceId,
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
         })
@@ -890,7 +888,7 @@ export async function importDatabaseFromExcel(
   const validTaskIds = new Set<string>(existingTasksMap.keys());
 
   for (const row of taskRows) {
-    const id = sanitizeDocId(str(row.id, 128), 'tsk');
+    const id = scopeIdForSpace(str(row.id, 128), 'tsk', spaceId);
     const existing = existingTasksMap.get(id);
     if (existing?.isLocked) {
       summary.skippedLockedTasks += 1;
@@ -902,14 +900,20 @@ export async function importDatabaseFromExcel(
     const title = str(row.title, 200) || code;
     const description = str(row.description, 5000);
     const rawProjectId = str(row.projectId, 64);
-    const projectId = rawProjectId && projectIdsSet.has(rawProjectId) ? rawProjectId : '';
-    const groupId = str(row.groupId, 64);
+    const mappedProjectId = rawProjectId ? scopeIdForSpace(rawProjectId, 'prj', spaceId) : '';
+    const projectId = mappedProjectId && projectIdsSet.has(mappedProjectId) ? mappedProjectId : '';
+    const rawGroupId = str(row.groupId, 64);
+    const groupId = rawGroupId ? scopeIdForSpace(rawGroupId, 'grp', spaceId) : '';
 
-    const rawCreator = sanitizeDocId(str(row.creatorId, 128) || actor.uid, 'usr');
-    const creatorId = activeUserIds.has(rawCreator) ? rawCreator : actor.uid;
-    const assigneeId = sanitizeDocId(str(row.assigneeId, 128) || creatorId, 'usr');
-    const reviewerId = sanitizeDocId(str(row.reviewerId, 128) || creatorId, 'usr');
-    const parentTaskId = str(row.parentTaskId, 64);
+    const rawCreator = str(row.creatorId, 128);
+    const mappedCreator = rawCreator ? scopeIdForSpace(rawCreator, 'usr', spaceId) : actor.uid;
+    const creatorId = activeUserIds.has(mappedCreator) ? mappedCreator : actor.uid;
+    const rawAssignee = str(row.assigneeId, 128);
+    const assigneeId = rawAssignee ? scopeIdForSpace(rawAssignee, 'usr', spaceId) : creatorId;
+    const rawReviewer = str(row.reviewerId, 128);
+    const reviewerId = rawReviewer ? scopeIdForSpace(rawReviewer, 'usr', spaceId) : creatorId;
+    const rawParentTask = str(row.parentTaskId, 64);
+    const parentTaskId = rawParentTask ? scopeIdForSpace(rawParentTask, 'tsk', spaceId) : '';
 
     const rawPriority = str(row.priority, 32) as TaskPriority;
     const priority: TaskPriority = VALID_PRIORITIES.includes(rawPriority)
@@ -935,7 +939,13 @@ export async function importDatabaseFromExcel(
     const reviewNote = str(row.reviewNote, 1000);
     const isLocked = parseBool(row.isLocked, status === 'HOAN_THANH');
     const participantIds = Array.from(
-      new Set([creatorId, assigneeId, reviewerId, actor.uid, ...splitList(row.participantIds)])
+      new Set([
+        creatorId,
+        assigneeId,
+        reviewerId,
+        actor.uid,
+        ...splitList(row.participantIds).map((u) => scopeIdForSpace(u, 'usr', spaceId)),
+      ])
     ).slice(0, 50);
 
     if (existing) {
@@ -990,7 +1000,7 @@ export async function importDatabaseFromExcel(
           reviewNote,
           isLocked,
           participantIds,
-          departmentId: DEPARTMENT_ID,
+          departmentId: spaceId,
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
         })
@@ -1008,15 +1018,20 @@ export async function importDatabaseFromExcel(
   const subtaskRows = readSheet('DauViecCon');
   const subOps: Array<(b: WriteBatch) => void> = [];
   for (const row of subtaskRows) {
-    const taskId = sanitizeDocId(str(row.taskId, 128), 'tsk');
+    const taskId = scopeIdForSpace(str(row.taskId, 128), 'tsk', spaceId);
     if (!validTaskIds.has(taskId)) continue;
-    const id = sanitizeDocId(str(row.id, 128), 'sub');
+    const id = scopeIdForSpace(str(row.id, 128), 'sub', spaceId);
     const title = str(row.title, 200);
     if (!title) continue;
     const isDone = parseBool(row.isDone, false);
-    const createdBy = sanitizeDocId(str(row.createdBy, 128) || actor.uid, 'usr');
+    const rawCreatedBy = str(row.createdBy, 128);
+    const createdBy = rawCreatedBy ? scopeIdForSpace(rawCreatedBy, 'usr', spaceId) : actor.uid;
     const taskParticipantIds = Array.from(
-      new Set([actor.uid, createdBy, ...splitList(row.taskParticipantIds)])
+      new Set([
+        actor.uid,
+        createdBy,
+        ...splitList(row.taskParticipantIds).map((u) => scopeIdForSpace(u, 'usr', spaceId)),
+      ])
     ).slice(0, 50);
 
     subOps.push((b) =>
@@ -1038,17 +1053,24 @@ export async function importDatabaseFromExcel(
   const commentRows = readSheet('BinhLuan');
   const cmtOps: Array<(b: WriteBatch) => void> = [];
   for (const row of commentRows) {
-    const taskId = sanitizeDocId(str(row.taskId, 128), 'tsk');
+    const taskId = scopeIdForSpace(str(row.taskId, 128), 'tsk', spaceId);
     if (!validTaskIds.has(taskId)) continue;
-    const id = sanitizeDocId(str(row.id, 128), 'cmt');
+    const id = scopeIdForSpace(str(row.id, 128), 'cmt', spaceId);
     const content = str(row.content, 2000);
     if (!content) continue;
-    const rawAuthor = sanitizeDocId(str(row.authorId, 128) || actor.uid, 'usr');
-    const authorId = activeUserIds.has(rawAuthor) ? rawAuthor : actor.uid;
+    const rawAuthor = str(row.authorId, 128);
+    const mappedAuthor = rawAuthor ? scopeIdForSpace(rawAuthor, 'usr', spaceId) : actor.uid;
+    const authorId = activeUserIds.has(mappedAuthor) ? mappedAuthor : actor.uid;
     const authorName = str(row.authorName, 120) || actor.fullName;
-    const mentions = splitList(row.mentions).slice(0, 20);
+    const mentions = splitList(row.mentions)
+      .slice(0, 20)
+      .map((u) => scopeIdForSpace(u, 'usr', spaceId));
     const taskParticipantIds = Array.from(
-      new Set([actor.uid, authorId, ...splitList(row.taskParticipantIds)])
+      new Set([
+        actor.uid,
+        authorId,
+        ...splitList(row.taskParticipantIds).map((u) => scopeIdForSpace(u, 'usr', spaceId)),
+      ])
     ).slice(0, 50);
 
     cmtOps.push((b) =>
@@ -1077,12 +1099,15 @@ export async function importDatabaseFromExcel(
   const coveredUnlockKeys = new Set<string>(existingUlIds);
 
   for (const row of unlockRows) {
-    const userId = sanitizeDocId(str(row.userId, 128), 'usr');
+    const userId = scopeIdForSpace(str(row.userId, 128), 'usr', spaceId);
     const workDate = str(row.workDate, 10);
     if (!/^\d{4}-\d{2}-\d{2}$/.test(workDate)) continue;
-    const id = `${userId}_${workDate}`;
-    const rawUnlockedBy = sanitizeDocId(str(row.unlockedBy, 128) || actor.uid, 'usr');
-    const unlockedBy = activeUserIds.has(rawUnlockedBy) ? rawUnlockedBy : actor.uid;
+    const id = `${userId}_${workDate}`.slice(0, 128);
+    const rawUnlockedBy = str(row.unlockedBy, 128);
+    const mappedUnlockedBy = rawUnlockedBy
+      ? scopeIdForSpace(rawUnlockedBy, 'usr', spaceId)
+      : actor.uid;
+    const unlockedBy = activeUserIds.has(mappedUnlockedBy) ? mappedUnlockedBy : actor.uid;
     const reason = str(row.reason, 500);
     const safeReason = reason.length >= 3 ? reason : 'Khôi phục từ bản sao lưu Excel';
 
@@ -1093,7 +1118,7 @@ export async function importDatabaseFromExcel(
         workDate,
         unlockedBy,
         reason: safeReason,
-        departmentId: DEPARTMENT_ID,
+        departmentId: spaceId,
         unlockedAt: serverTimestamp(),
       })
     );
@@ -1101,11 +1126,13 @@ export async function importDatabaseFromExcel(
   }
 
   for (const row of workLogRows) {
-    const userId = sanitizeDocId(str(row.userId, 128) || actor.uid, 'usr');
+    const rawUser = str(row.userId, 128);
+    const mappedUser = rawUser ? scopeIdForSpace(rawUser, 'usr', spaceId) : actor.uid;
+    const userId = activeUserIds.has(mappedUser) ? mappedUser : actor.uid;
     const workDate = str(row.workDate, 10);
     if (!/^\d{4}-\d{2}-\d{2}$/.test(workDate)) continue;
     const workDateNum = dateStrToNum(workDate);
-    const key = `${userId}_${workDate}`;
+    const key = `${userId}_${workDate}`.slice(0, 128);
     if (workDateNum < todayNum && !coveredUnlockKeys.has(key)) {
       ulOps.push((b) =>
         b.set(doc(db, 'workLogUnlocks', key), {
@@ -1114,7 +1141,7 @@ export async function importDatabaseFromExcel(
           workDate,
           unlockedBy: actor.uid,
           reason: 'Khôi phục nhật ký làm việc từ file Excel',
-          departmentId: DEPARTMENT_ID,
+          departmentId: spaceId,
           unlockedAt: serverTimestamp(),
         })
       );
@@ -1128,11 +1155,12 @@ export async function importDatabaseFromExcel(
   // 8. NhatKyLamViec (WorkLogs)
   const wlOps: Array<(b: WriteBatch) => void> = [];
   for (const row of workLogRows) {
-    const id = sanitizeDocId(str(row.id, 128), 'wl');
-    const taskId = sanitizeDocId(str(row.taskId, 128), 'tsk');
+    const id = scopeIdForSpace(str(row.id, 128), 'wl', spaceId);
+    const taskId = scopeIdForSpace(str(row.taskId, 128), 'tsk', spaceId);
     if (!validTaskIds.has(taskId)) continue;
-    const rawUser = sanitizeDocId(str(row.userId, 128) || actor.uid, 'usr');
-    const userId = activeUserIds.has(rawUser) ? rawUser : actor.uid;
+    const rawUser = str(row.userId, 128);
+    const mappedUser = rawUser ? scopeIdForSpace(rawUser, 'usr', spaceId) : actor.uid;
+    const userId = activeUserIds.has(mappedUser) ? mappedUser : actor.uid;
     const workDate = str(row.workDate, 10);
     if (!/^\d{4}-\d{2}-\d{2}$/.test(workDate)) continue;
     const workDateNum = dateStrToNum(workDate);
@@ -1141,11 +1169,15 @@ export async function importDatabaseFromExcel(
     const progressPercent = Math.min(100, Math.max(0, Number(row.progressPercent) || 0));
     const note = str(row.note, 1000) || 'Nhật ký làm việc';
     const rawProjectId = str(row.projectId, 64);
-    const projectId = rawProjectId && projectIdsSet.has(rawProjectId) ? rawProjectId : '';
-    const viewerIds = Array.from(new Set([userId, actor.uid, ...splitList(row.viewerIds)])).slice(
-      0,
-      30
-    );
+    const mappedProjectId = rawProjectId ? scopeIdForSpace(rawProjectId, 'prj', spaceId) : '';
+    const projectId = mappedProjectId && projectIdsSet.has(mappedProjectId) ? mappedProjectId : '';
+    const viewerIds = Array.from(
+      new Set([
+        userId,
+        actor.uid,
+        ...splitList(row.viewerIds).map((u) => scopeIdForSpace(u, 'usr', spaceId)),
+      ])
+    ).slice(0, 30);
 
     if (existingWlIds.has(id)) {
       wlOps.push((b) =>
@@ -1172,7 +1204,7 @@ export async function importDatabaseFromExcel(
           progressPercent,
           note,
           viewerIds,
-          departmentId: DEPARTMENT_ID,
+          departmentId: spaceId,
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
         })
@@ -1190,7 +1222,7 @@ export async function importDatabaseFromExcel(
     const c = cfgRows[0];
     const cfgOps: Array<(b: WriteBatch) => void> = [
       (b) =>
-        b.set(doc(db, 'systemConfigs', 'department'), {
+        b.set(doc(db, 'systemConfigs', cfgId), {
           lockHour: Math.min(23, Math.max(0, Number(c.lockHour) || 23)),
           lockMinute: Math.min(59, Math.max(0, Number(c.lockMinute) || 59)),
           reminderHour: Math.min(23, Math.max(0, Number(c.reminderHour) || 17)),
@@ -1198,6 +1230,7 @@ export async function importDatabaseFromExcel(
           timezone: str(c.timezone, 40) || 'Asia/Ho_Chi_Minh',
           defaultLabels: splitList(c.defaultLabels).slice(0, 30),
           holidays: splitList(c.holidays).slice(0, 50),
+          departmentId: spaceId,
           updatedBy: actor.uid,
           updatedAt: serverTimestamp(),
         }),
@@ -1209,7 +1242,7 @@ export async function importDatabaseFromExcel(
     actor,
     action: 'Import cơ sở dữ liệu Excel',
     targetType: 'system',
-    targetId: DEPARTMENT_ID,
+    targetId: spaceId,
     detail: `Import từ file ${file.name}: ${summary.users} nhân sự, ${summary.groups} nhóm, ${summary.projects} dự án, ${summary.tasks} công việc, ${summary.workLogs} log work`,
     allUsers: importedUsersList.length > 0 ? importedUsersList : [actor],
   });
