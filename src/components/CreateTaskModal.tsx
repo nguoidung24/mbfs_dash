@@ -82,8 +82,8 @@ export function CreateTaskModal({
   );
 
   const assignableUsers = useMemo(
-    () => getAssignableUsers(currentUser, users, selectedProject),
-    [currentUser, users, selectedProject]
+    () => getAssignableUsers(currentUser, users, selectedProject, projects, groups),
+    [currentUser, users, selectedProject, projects, groups]
   );
 
   const potentialReviewers = useMemo(
@@ -184,9 +184,9 @@ export function CreateTaskModal({
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4">
-      <div className="bg-white border border-slate-200 rounded-xl w-full max-w-2xl max-h-[90vh] flex flex-col">
-        <div className="flex items-center justify-between px-6 py-4 border-b border-slate-200">
+    <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-slate-900/40 p-0 sm:p-4">
+      <div className="bg-white border border-slate-200 rounded-t-2xl sm:rounded-xl w-full max-w-2xl max-h-[92vh] flex flex-col pb-safe">
+        <div className="flex items-center justify-between px-4 sm:px-6 py-4 border-b border-slate-200">
           <div>
             <h2 className="text-base font-semibold text-slate-900">
               {editingTask ? `Chỉnh sửa công việc ${editingTask.code}` : 'Tạo công việc mới'}

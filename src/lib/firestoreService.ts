@@ -18,6 +18,7 @@ import {
   query,
   serverTimestamp,
   setDoc,
+  Timestamp,
   updateDoc,
   where,
   writeBatch,
@@ -61,7 +62,7 @@ import {
   OperationType,
   provisionerAuth,
 } from './firebase';
-import { buildParticipantIds } from './rbac';
+import { buildParticipantIds, canManageProjectMembers } from './rbac';
 import { dateStrToNum, getVietnamNowParts } from './time';
 
 const SESSION_STORAGE_KEY = 'dama2_session';
@@ -88,6 +89,60 @@ export function isValidUsernameFormat(username: string): boolean {
 export function makeId(prefix: string): string {
   const rand = Math.random().toString(36).slice(2, 8);
   return `${prefix}_${Date.now().toString(36)}_${rand}`;
+}
+
+const VALID_ROLE_CODES: RoleCode[] = [
+  'ADMIN',
+  'TRUONG_PHONG',
+  'PHO_PHONG',
+  'QUAN_LY_DU_AN',
+  'TRUONG_NHOM',
+  'CHUYEN_VIEN',
+];
+
+function sanitizeRolesList(roles: unknown): RoleCode[] {
+  if (!Array.isArray(roles)) return ['CHUYEN_VIEN'];
+  const filtered = Array.from(
+    new Set(roles.filter((r): r is RoleCode => VALID_ROLE_CODES.includes(r as RoleCode)))
+  ).slice(0, 6);
+  return filtered.length > 0 ? filtered : ['CHUYEN_VIEN'];
+}
+
+function isFirestoreTimestampValue(value: unknown): value is Timestamp {
+  if (value instanceof Timestamp) return true;
+  if (typeof value === 'object' && value !== null) {
+    const obj = value as { seconds?: unknown; nanoseconds?: unknown };
+    return typeof obj.seconds === 'number' && typeof obj.nanoseconds === 'number';
+  }
+  return false;
+}
+
+async function upsertAuthBinding(params: {
+  authUid: string;
+  userId: string;
+  departmentId: string;
+  isActive: boolean;
+}): Promise<void> {
+  const bindingRef = doc(db, 'authBindings', params.authUid);
+  const bindingSnap = await getDocFromServer(bindingRef);
+  if (bindingSnap.exists()) {
+    const bData = bindingSnap.data() as Record<string, unknown>;
+    await updateDoc(bindingRef, {
+      userId: params.userId,
+      isActive: params.isActive,
+      ...(isFirestoreTimestampValue(bData?.createdAt) ? {} : { createdAt: serverTimestamp() }),
+      updatedAt: serverTimestamp(),
+    });
+  } else {
+    await setDoc(bindingRef, {
+      authUid: params.authUid,
+      userId: params.userId,
+      departmentId: params.departmentId,
+      isActive: params.isActive,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+  }
 }
 
 export function clearSpaceKeyCache(spaceId?: string): void {
@@ -234,11 +289,12 @@ export async function logoutSession(): Promise<void> {
 }
 
 export async function runBatchOps(
-  ops: Array<(batch: WriteBatch) => void>
+  ops: Array<(batch: WriteBatch) => void>,
+  chunkSize: number = 400
 ): Promise<void> {
-  const CHUNK_SIZE = 400;
-  for (let i = 0; i < ops.length; i += CHUNK_SIZE) {
-    const chunk = ops.slice(i, i + CHUNK_SIZE);
+  const safeChunk = Math.max(1, Math.min(400, chunkSize));
+  for (let i = 0; i < ops.length; i += safeChunk) {
+    const chunk = ops.slice(i, i + safeChunk);
     const batch = writeBatch(db);
     for (const op of chunk) {
       op(batch);
@@ -662,11 +718,11 @@ export async function logSystemAudit(params: {
     await setDoc(doc(db, 'auditLogs', id), {
       id,
       actorId: params.actor.uid,
-      actorName: params.actor.fullName,
-      action: params.action,
-      targetType: params.targetType,
-      targetId: params.targetId,
-      detail: params.detail.slice(0, 1000),
+      actorName: (params.actor.fullName || 'Nhân sự').trim().slice(0, 120) || 'Nhân sự',
+      action: params.action.trim().slice(0, 80) || 'Thao tác',
+      targetType: params.targetType.trim().slice(0, 40) || 'system',
+      targetId: params.targetId.trim().slice(0, 128) || id,
+      detail: params.detail.trim().slice(0, 1000) || '-',
       viewerIds,
       departmentId: getActiveSpaceId(),
       createdAt: serverTimestamp(),
@@ -1151,18 +1207,25 @@ export async function saveProject(params: {
 }): Promise<void> {
   const { existing, input, actor, allUsers } = params;
   const id = existing ? existing.id : makeId('prj');
-  const leadershipIds = allUsers
-    .filter(
-      (u) =>
-        u.roles.includes('ADMIN') ||
-        u.roles.includes('TRUONG_PHONG') ||
-        u.roles.includes('PHO_PHONG')
-    )
-    .map((u) => u.uid);
+  const validUidSet = new Set(allUsers.filter((u) => u.isActive).map((u) => u.uid));
+  const canEditMembers = !existing || canManageProjectMembers(actor);
 
-  const memberIds = Array.from(
-    new Set([input.pmId, actor.uid, ...input.memberIds, ...leadershipIds])
-  ).slice(0, 50);
+  const resolvedPmId = canEditMembers
+    ? validUidSet.has(input.pmId)
+      ? input.pmId
+      : actor.uid
+    : existing.pmId;
+
+  // Strictly keep only PM + explicitly selected active members (never auto-add unrelated leadership)
+  const memberIds = canEditMembers
+    ? Array.from(
+        new Set(
+          [resolvedPmId, ...input.memberIds].filter(
+            (uid) => Boolean(uid) && (validUidSet.has(uid) || uid === resolvedPmId)
+          )
+        )
+      ).slice(0, 50)
+    : existing.memberIds;
 
   try {
     const batch = writeBatch(db);
@@ -1174,11 +1237,28 @@ export async function saveProject(params: {
         startDate: input.startDate,
         expectedEndDate: input.expectedEndDate,
         status: input.status,
-        pmId: input.pmId,
+        pmId: resolvedPmId,
         memberIds,
         labels: input.labels.slice(0, 15),
         updatedAt: serverTimestamp(),
       });
+
+      if (canEditMembers) {
+        const existingMembersSnap = await getDocs(collection(db, 'projects', id, 'members'));
+        const nextMemberSet = new Set(memberIds);
+        for (const mDoc of existingMembersSnap.docs) {
+          if (!nextMemberSet.has(mDoc.id)) {
+            batch.delete(mDoc.ref);
+          }
+        }
+        for (const uid of memberIds) {
+          batch.set(doc(db, 'projects', id, 'members', uid), {
+            userId: uid,
+            projectRole: uid === resolvedPmId ? 'QUAN_LY_DU_AN' : 'THANH_VIEN',
+            joinedAt: serverTimestamp(),
+          });
+        }
+      }
     } else {
       batch.set(doc(db, 'projects', id), {
         id,
@@ -1188,7 +1268,7 @@ export async function saveProject(params: {
         startDate: input.startDate,
         expectedEndDate: input.expectedEndDate,
         status: input.status,
-        pmId: input.pmId,
+        pmId: resolvedPmId,
         memberIds,
         labels: input.labels.slice(0, 15),
         createdBy: actor.uid,
@@ -1196,14 +1276,14 @@ export async function saveProject(params: {
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
-    }
 
-    for (const uid of memberIds) {
-      batch.set(doc(db, 'projects', id, 'members', uid), {
-        userId: uid,
-        projectRole: uid === input.pmId ? 'QUAN_LY_DU_AN' : 'THANH_VIEN',
-        joinedAt: serverTimestamp(),
-      });
+      for (const uid of memberIds) {
+        batch.set(doc(db, 'projects', id, 'members', uid), {
+          userId: uid,
+          projectRole: uid === resolvedPmId ? 'QUAN_LY_DU_AN' : 'THANH_VIEN',
+          joinedAt: serverTimestamp(),
+        });
+      }
     }
 
     await batch.commit();
@@ -1212,11 +1292,197 @@ export async function saveProject(params: {
       action: existing ? 'Cập nhật dự án' : 'Tạo dự án',
       targetType: 'project',
       targetId: id,
-      detail: `${existing ? 'Cập nhật' : 'Tạo mới'} dự án ${input.code.toUpperCase()} - ${input.name}`,
+      detail: `${existing ? 'Cập nhật' : 'Tạo mới'} dự án ${input.code.toUpperCase()} - ${input.name} (${memberIds.length} thành viên)`,
       allUsers,
     });
   } catch (error) {
     handleFirestoreError(error, OperationType.WRITE, `projects/${id}`);
+  }
+}
+
+export async function addProjectMember(params: {
+  project: Project;
+  memberUid: string;
+  projectRole?: 'QUAN_LY_DU_AN' | 'THANH_VIEN';
+  actor: UserProfile;
+  allUsers: UserProfile[];
+}): Promise<void> {
+  const { project, memberUid, projectRole = 'THANH_VIEN', actor, allUsers } = params;
+  if (!canManageProjectMembers(actor)) {
+    throw new Error('Chỉ Trưởng phòng hoặc Quản trị viên mới có quyền thêm thành viên dự án.');
+  }
+  const targetUser = allUsers.find((u) => u.uid === memberUid && u.isActive);
+  if (!targetUser) {
+    throw new Error('Không tìm thấy nhân sự hợp lệ để thêm vào dự án.');
+  }
+  if (project.memberIds.includes(memberUid)) {
+    throw new Error('Nhân sự này đã là thành viên của dự án.');
+  }
+  if (project.memberIds.length >= 50) {
+    throw new Error('Dự án đã đạt tối đa 50 thành viên.');
+  }
+
+  const nextMemberIds = Array.from(new Set([...project.memberIds, memberUid])).slice(0, 50);
+  const nextPmId = projectRole === 'QUAN_LY_DU_AN' ? memberUid : project.pmId;
+
+  try {
+    const batch = writeBatch(db);
+    batch.update(doc(db, 'projects', project.id), {
+      memberIds: nextMemberIds,
+      pmId: nextPmId,
+      updatedAt: serverTimestamp(),
+    });
+    if (projectRole === 'QUAN_LY_DU_AN' && project.pmId && project.pmId !== memberUid) {
+      batch.set(doc(db, 'projects', project.id, 'members', project.pmId), {
+        userId: project.pmId,
+        projectRole: 'THANH_VIEN',
+        joinedAt: serverTimestamp(),
+      });
+    }
+    batch.set(doc(db, 'projects', project.id, 'members', memberUid), {
+      userId: memberUid,
+      projectRole,
+      joinedAt: serverTimestamp(),
+    });
+    await batch.commit();
+
+    await logSystemAudit({
+      actor,
+      action: 'Thêm thành viên dự án',
+      targetType: 'project',
+      targetId: project.id,
+      detail: `Thêm ${targetUser.fullName} (${targetUser.employeeCode}) vào dự án ${project.code} với vai trò ${projectRole === 'QUAN_LY_DU_AN' ? 'Quản lý dự án (PM)' : 'Thành viên'}`,
+      allUsers,
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, `projects/${project.id}/members/${memberUid}`);
+  }
+}
+
+export async function updateProjectMember(params: {
+  project: Project;
+  currentMemberUid: string;
+  nextMemberUid: string;
+  nextRole: 'QUAN_LY_DU_AN' | 'THANH_VIEN';
+  actor: UserProfile;
+  allUsers: UserProfile[];
+}): Promise<void> {
+  const { project, currentMemberUid, nextMemberUid, nextRole, actor, allUsers } = params;
+  if (!canManageProjectMembers(actor)) {
+    throw new Error('Chỉ Trưởng phòng hoặc Quản trị viên mới có quyền sửa thành viên dự án.');
+  }
+
+  const nextUser = allUsers.find((u) => u.uid === nextMemberUid && u.isActive);
+  if (!nextUser) {
+    throw new Error('Nhân sự được chọn không hợp lệ hoặc đã ngừng hoạt động.');
+  }
+
+  const isReplacingUser = currentMemberUid !== nextMemberUid;
+  if (isReplacingUser && project.memberIds.includes(nextMemberUid)) {
+    throw new Error('Nhân sự thay thế đã có mặt trong danh sách thành viên dự án.');
+  }
+
+  const wasPm = currentMemberUid === project.pmId;
+  if (wasPm && nextRole !== 'QUAN_LY_DU_AN') {
+    throw new Error(
+      'Dự án luôn cần một Quản lý dự án (PM). Để hạ vai trò người này, hãy chọn một thành viên khác làm PM hoặc thay thế bằng nhân sự khác.'
+    );
+  }
+
+  const nextMemberIds = isReplacingUser
+    ? project.memberIds.map((uid) => (uid === currentMemberUid ? nextMemberUid : uid))
+    : project.memberIds;
+
+  const nextPmId = nextRole === 'QUAN_LY_DU_AN' ? nextMemberUid : project.pmId;
+
+  try {
+    const batch = writeBatch(db);
+    batch.update(doc(db, 'projects', project.id), {
+      memberIds: nextMemberIds,
+      pmId: nextPmId,
+      updatedAt: serverTimestamp(),
+    });
+
+    if (isReplacingUser) {
+      batch.delete(doc(db, 'projects', project.id, 'members', currentMemberUid));
+    }
+
+    if (nextRole === 'QUAN_LY_DU_AN' && project.pmId && project.pmId !== currentMemberUid) {
+      batch.set(doc(db, 'projects', project.id, 'members', project.pmId), {
+        userId: project.pmId,
+        projectRole: 'THANH_VIEN',
+        joinedAt: serverTimestamp(),
+      });
+    }
+
+    batch.set(doc(db, 'projects', project.id, 'members', nextMemberUid), {
+      userId: nextMemberUid,
+      projectRole: nextRole,
+      joinedAt: serverTimestamp(),
+    });
+
+    await batch.commit();
+
+    const prevUser = allUsers.find((u) => u.uid === currentMemberUid);
+    const roleLabel = nextRole === 'QUAN_LY_DU_AN' ? 'Quản lý dự án (PM)' : 'Thành viên';
+    const detailText = isReplacingUser
+      ? `Thay thế ${prevUser?.fullName || currentMemberUid} bằng ${nextUser.fullName} (${nextUser.employeeCode}) với vai trò ${roleLabel} trong dự án ${project.code}`
+      : `Cập nhật vai trò của ${nextUser.fullName} (${nextUser.employeeCode}) thành ${roleLabel} trong dự án ${project.code}`;
+
+    await logSystemAudit({
+      actor,
+      action: 'Sửa thành viên dự án',
+      targetType: 'project',
+      targetId: project.id,
+      detail: detailText,
+      allUsers,
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, `projects/${project.id}/members/${nextMemberUid}`);
+  }
+}
+
+export async function removeProjectMember(params: {
+  project: Project;
+  memberUid: string;
+  actor: UserProfile;
+  allUsers: UserProfile[];
+}): Promise<void> {
+  const { project, memberUid, actor, allUsers } = params;
+  if (!canManageProjectMembers(actor)) {
+    throw new Error('Chỉ Trưởng phòng hoặc Quản trị viên mới có quyền xóa thành viên dự án.');
+  }
+  if (memberUid === project.pmId) {
+    throw new Error(
+      'Không thể xóa Quản lý dự án (PM). Hãy chọn một thành viên khác làm PM bằng nút Sửa trước khi xóa.'
+    );
+  }
+  const nextMemberIds = project.memberIds.filter((uid) => uid !== memberUid);
+  if (nextMemberIds.length === 0) {
+    throw new Error('Dự án phải có ít nhất 1 thành viên.');
+  }
+
+  const targetUser = allUsers.find((u) => u.uid === memberUid);
+
+  try {
+    const batch = writeBatch(db);
+    batch.update(doc(db, 'projects', project.id), {
+      memberIds: nextMemberIds,
+      updatedAt: serverTimestamp(),
+    });
+    batch.delete(doc(db, 'projects', project.id, 'members', memberUid));
+    await batch.commit();
+
+    await logSystemAudit({
+      actor,
+      action: 'Xóa thành viên dự án',
+      targetType: 'project',
+      targetId: project.id,
+      detail: `Xóa ${targetUser ? `${targetUser.fullName} (${targetUser.employeeCode})` : memberUid} khỏi dự án ${project.code}`,
+      allUsers,
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.DELETE, `projects/${project.id}/members/${memberUid}`);
   }
 }
 
@@ -1354,6 +1620,7 @@ export async function saveUserByAdmin(params: {
   const needsAuthProvision = !existing || !existing.authUid;
   let provisionedAuthUser: Awaited<ReturnType<typeof createUserWithEmailAndPassword>>['user'] | null =
     null;
+  let createdFreshAuthUser = false;
 
   if (needsAuthProvision) {
     if (!username) {
@@ -1373,24 +1640,49 @@ export async function saveUserByAdmin(params: {
         pwd
       );
       provisionedAuthUser = cred.user;
+      createdFreshAuthUser = true;
     } catch (err) {
       const code = getAuthErrorCode(err);
       if (code === 'auth/email-already-in-use') {
-        throw new Error(
-          `Tên đăng nhập "${username}" đã tồn tại trên hệ thống xác thực Firebase Auth.`
-        );
-      }
-      if (code === 'auth/operation-not-allowed') {
+        try {
+          const cred = await signInWithEmailAndPassword(
+            provisionerAuth,
+            internalEmail,
+            pwd
+          );
+          const existingBinding = await getDocFromServer(doc(db, 'authBindings', cred.user.uid));
+          if (existingBinding.exists() && existingBinding.data()?.userId !== uid) {
+            throw new Error(
+              `Tên đăng nhập "${username}" đang được liên kết với một tài khoản nhân sự khác.`
+            );
+          }
+          provisionedAuthUser = cred.user;
+        } catch (recoverErr) {
+          if (
+            recoverErr instanceof Error &&
+            recoverErr.message.includes('đang được liên kết')
+          ) {
+            throw recoverErr;
+          }
+          throw new Error(
+            `Tên đăng nhập "${username}" đã tồn tại trên Firebase Auth (có thể từ trước khi xóa dữ liệu). Hãy nhập đúng mật khẩu cũ của tài khoản đó để khôi phục liên kết, hoặc chọn tên đăng nhập khác.`
+          );
+        }
+      } else if (code === 'auth/operation-not-allowed') {
         throw new Error(
           'Phương thức Email/Password chưa được bật trong Firebase Authentication.'
         );
+      } else {
+        throw new Error(
+          err instanceof Error ? err.message : 'Không thể khởi tạo tài khoản Firebase Auth.'
+        );
       }
-      throw new Error(
-        err instanceof Error ? err.message : 'Không thể khởi tạo tài khoản Firebase Auth.'
-      );
     }
   }
 
+  const sanitizedRoles = sanitizeRolesList(input.roles);
+  const sanitizedGroupId = (input.groupId || '').trim().slice(0, 64);
+  const sanitizedManagerId = (input.managerId || '').trim().slice(0, 128);
   const resolvedAuthUid = provisionedAuthUser?.uid || existing?.authUid || '';
   const payload: EncryptedAccountPayload = {
     username,
@@ -1401,6 +1693,7 @@ export async function saveUserByAdmin(params: {
   };
   const encryptedAccount = await encryptAccountData(spaceKey, payload);
   const resolvedActive = existing && existing.uid === actor.uid ? true : input.isActive;
+  let currentStep = 'user_doc';
 
   try {
     if (existing) {
@@ -1413,31 +1706,27 @@ export async function saveUserByAdmin(params: {
         mustChangePassword: provisionedAuthUser
           ? true
           : Boolean(existingRaw?.mustChangePassword),
-        roles: input.roles,
-        groupId: input.groupId,
-        managerId: input.managerId,
+        roles: sanitizedRoles,
+        groupId: sanitizedGroupId,
+        managerId: sanitizedManagerId,
         isActive: resolvedActive,
         departmentId: spaceId,
-        createdAt: existingRaw?.createdAt || serverTimestamp(),
+        createdAt: isFirestoreTimestampValue(existingRaw?.createdAt)
+          ? existingRaw.createdAt
+          : serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
 
-      if (provisionedAuthUser) {
-        await setDoc(doc(db, 'authBindings', resolvedAuthUid), {
-          authUid: resolvedAuthUid,
-          userId: uid,
-          departmentId: spaceId,
-          isActive: resolvedActive,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
-      } else if (existing.uid !== actor.uid && resolvedAuthUid) {
-        const bindingRef = doc(db, 'authBindings', resolvedAuthUid);
-        const bindingSnap = await getDocFromServer(bindingRef);
-        if (bindingSnap.exists()) {
-          await updateDoc(bindingRef, {
+      if (resolvedAuthUid) {
+        currentStep = 'auth_binding';
+        const isDuplicateSharingActorAuth =
+          Boolean(actor.authUid) && resolvedAuthUid === actor.authUid && uid !== actor.uid;
+        if (!isDuplicateSharingActorAuth) {
+          await upsertAuthBinding({
+            authUid: resolvedAuthUid,
+            userId: uid,
+            departmentId: spaceId,
             isActive: resolvedActive,
-            updatedAt: serverTimestamp(),
           });
         }
       }
@@ -1447,26 +1736,26 @@ export async function saveUserByAdmin(params: {
         authUid: resolvedAuthUid,
         encryptedAccount,
         mustChangePassword: true,
-        roles: input.roles,
-        groupId: input.groupId,
-        managerId: input.managerId,
+        roles: sanitizedRoles,
+        groupId: sanitizedGroupId,
+        managerId: sanitizedManagerId,
         isActive: resolvedActive,
         departmentId: spaceId,
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
 
-      await setDoc(doc(db, 'authBindings', resolvedAuthUid), {
+      currentStep = 'auth_binding';
+      await upsertAuthBinding({
         authUid: resolvedAuthUid,
         userId: uid,
         departmentId: spaceId,
         isActive: resolvedActive,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
       });
     }
 
     if (emailLower) {
+      currentStep = 'private_info';
       const encryptedPrivate = await encryptPrivateData(spaceKey, { email: emailLower });
       await setDoc(doc(db, 'users', uid, 'private', 'info'), {
         uid,
@@ -1475,22 +1764,24 @@ export async function saveUserByAdmin(params: {
       });
     }
 
+    currentStep = 'audit_log';
     await logSystemAudit({
       actor,
       action: existing ? 'Cập nhật nhân sự' : 'Tạo nhân sự mới',
       targetType: 'user',
       targetId: uid,
-      detail: `${existing ? 'Cập nhật' : 'Tạo mới'} ${input.fullName} (${input.employeeCode}, @${username || 'chưa gắn TK'}) - Vai trò: ${input.roles.join(', ')}`,
+      detail: `${existing ? 'Cập nhật' : 'Tạo mới'} ${input.fullName} (${input.employeeCode}, @${username || 'chưa gắn TK'}) - Vai trò: ${sanitizedRoles.join(', ')}`,
       allUsers,
     });
   } catch (error) {
-    if (provisionedAuthUser) {
+    if (provisionedAuthUser && createdFreshAuthUser) {
       try {
         await deleteUser(provisionedAuthUser);
       } catch {
         // ignore rollback error
       }
     }
+    console.error(`saveUserByAdmin failed at step=${currentStep} for users/${uid}:`, error);
     handleFirestoreError(error, OperationType.WRITE, `users/${uid}`);
   } finally {
     try {
@@ -1513,21 +1804,39 @@ export async function toggleUserLockByAdmin(params: {
       'Tài khoản cũ chưa kích hoạt Firebase Auth & mã hóa dữ liệu. Vui lòng bấm "Kích hoạt Auth" hoặc "Sửa" cho nhân sự này trước.'
     );
   }
+  const spaceId = getActiveSpaceId();
   try {
-    const batch = writeBatch(db);
-    batch.update(doc(db, 'users', targetUser.uid), {
+    const userRef = doc(db, 'users', targetUser.uid);
+    const userSnap = await getDocFromServer(userRef);
+    const raw = userSnap.exists() ? (userSnap.data() as Record<string, unknown>) : null;
+    await setDoc(userRef, {
+      uid: targetUser.uid,
+      authUid: targetUser.authUid,
+      encryptedAccount:
+        (raw && typeof raw.encryptedAccount === 'string' && raw.encryptedAccount) ||
+        targetUser.encryptedAccount,
+      mustChangePassword: Boolean(raw?.mustChangePassword),
+      roles: sanitizeRolesList(raw?.roles ?? targetUser.roles),
+      groupId: (typeof raw?.groupId === 'string' ? raw.groupId : targetUser.groupId || '').trim().slice(0, 64),
+      managerId: (typeof raw?.managerId === 'string' ? raw.managerId : targetUser.managerId || '').trim().slice(0, 128),
       isActive: nextActive,
+      departmentId: spaceId,
+      createdAt: isFirestoreTimestampValue(raw?.createdAt) ? raw.createdAt : serverTimestamp(),
       updatedAt: serverTimestamp(),
     });
-    const bindingRef = doc(db, 'authBindings', targetUser.authUid);
-    const bindingSnap = await getDocFromServer(bindingRef);
-    if (bindingSnap.exists()) {
-      batch.update(bindingRef, {
+
+    const isDuplicateSharingActorAuth =
+      Boolean(actor.authUid) &&
+      targetUser.authUid === actor.authUid &&
+      targetUser.uid !== actor.uid;
+    if (!isDuplicateSharingActorAuth) {
+      await upsertAuthBinding({
+        authUid: targetUser.authUid,
+        userId: targetUser.uid,
+        departmentId: spaceId,
         isActive: nextActive,
-        updatedAt: serverTimestamp(),
       });
     }
-    await batch.commit();
 
     await logSystemAudit({
       actor,
@@ -1594,9 +1903,9 @@ export async function activateLegacyUserAuthByAdmin(params: {
 
     const encryptedAccount = await encryptAccountData(spaceKey, {
       username,
-      employeeCode: targetUser.employeeCode,
-      fullName: targetUser.fullName,
-      title: targetUser.title || '',
+      employeeCode: (targetUser.employeeCode || 'NV').trim().slice(0, 32),
+      fullName: (targetUser.fullName || 'Nhân sự').trim().slice(0, 120),
+      title: (targetUser.title || '').trim().slice(0, 120),
       email,
     });
 
@@ -1605,22 +1914,22 @@ export async function activateLegacyUserAuthByAdmin(params: {
       authUid: provisionedUser.uid,
       encryptedAccount,
       mustChangePassword: requireChangeOnNextLogin,
-      roles: targetUser.roles,
-      groupId: targetUser.groupId || '',
-      managerId: targetUser.managerId || '',
+      roles: sanitizeRolesList(targetUser.roles),
+      groupId: (targetUser.groupId || '').trim().slice(0, 64),
+      managerId: (targetUser.managerId || '').trim().slice(0, 128),
       isActive: targetUser.isActive,
       departmentId: spaceId,
-      createdAt: existingRaw?.createdAt || serverTimestamp(),
+      createdAt: isFirestoreTimestampValue(existingRaw?.createdAt)
+        ? existingRaw.createdAt
+        : serverTimestamp(),
       updatedAt: serverTimestamp(),
     });
 
-    await setDoc(doc(db, 'authBindings', provisionedUser.uid), {
+    await upsertAuthBinding({
       authUid: provisionedUser.uid,
       userId: targetUser.uid,
       departmentId: spaceId,
       isActive: targetUser.isActive,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
     });
 
     if (email) {
@@ -1782,9 +2091,11 @@ export async function wipeAllDepartmentData(actor: UserProfile): Promise<{
   const spaceId = getActiveSpaceId();
   const cfgId = getSystemConfigDocId();
   const defaultAdminUid = getDefaultAdminUid();
+  let currentStep = 'init';
 
   try {
     // 1. Delete tasks and their subcollections (subtasks, comments, auditLogs)
+    currentStep = 'tasks';
     const tasksSnap = await getDocs(
       query(collection(db, 'tasks'), where('departmentId', '==', spaceId))
     );
@@ -1813,10 +2124,12 @@ export async function wipeAllDepartmentData(actor: UserProfile): Promise<{
       deletedDocs += 1;
     }
 
-    if (subDeleteOps.length > 0) await runBatchOps(subDeleteOps);
+    // Subcollection rules call get(tasks/{taskId}); keep batch <= 8 to stay well under Firestore's per-batch get/exists limit
+    if (subDeleteOps.length > 0) await runBatchOps(subDeleteOps, 8);
     if (taskDeleteOps.length > 0) await runBatchOps(taskDeleteOps);
 
     // 2. Delete workLogs & workLogUnlocks
+    currentStep = 'workLogs';
     const [wlSnap, ulSnap] = await Promise.all([
       getDocs(query(collection(db, 'workLogs'), where('departmentId', '==', spaceId))),
       getDocs(query(collection(db, 'workLogUnlocks'), where('departmentId', '==', spaceId))),
@@ -1833,6 +2146,7 @@ export async function wipeAllDepartmentData(actor: UserProfile): Promise<{
     if (wlOps.length > 0) await runBatchOps(wlOps);
 
     // 3. Delete projects & project members
+    currentStep = 'projects';
     const prjSnap = await getDocs(
       query(collection(db, 'projects'), where('departmentId', '==', spaceId))
     );
@@ -1847,10 +2161,11 @@ export async function wipeAllDepartmentData(actor: UserProfile): Promise<{
       prjDeleteOps.push((b) => b.delete(pDoc.ref));
       deletedDocs += 1;
     }
-    if (prjMemberOps.length > 0) await runBatchOps(prjMemberOps);
+    if (prjMemberOps.length > 0) await runBatchOps(prjMemberOps, 8);
     if (prjDeleteOps.length > 0) await runBatchOps(prjDeleteOps);
 
     // 4. Delete groups, system auditLogs, and systemConfigs
+    currentStep = 'groups_configs';
     const [grpSnap, audSnap, cfgSnap] = await Promise.all([
       getDocs(query(collection(db, 'groups'), where('departmentId', '==', spaceId))),
       getDocs(query(collection(db, 'auditLogs'), where('departmentId', '==', spaceId))),
@@ -1871,49 +2186,105 @@ export async function wipeAllDepartmentData(actor: UserProfile): Promise<{
     }
     if (miscOps.length > 0) await runBatchOps(miscOps);
 
-    // 5. Delete non-admin users' private info & authBindings BEFORE user docs
+    // 5. Delete ALL non-admin user accounts, private info & authBindings
+    currentStep = 'users_cleanup';
     const usersSnap = await getDocs(
       query(collection(db, 'users'), where('departmentId', '==', spaceId))
     );
+    const keptAdminUid = usersSnap.docs.some((d) => d.id === defaultAdminUid)
+      ? defaultAdminUid
+      : actor.uid;
+    const protectedAuthUids = new Set<string>();
+    for (const uDoc of usersSnap.docs) {
+      if (uDoc.id === keptAdminUid) {
+        const uData = uDoc.data() as Record<string, unknown>;
+        if (typeof uData.authUid === 'string' && uData.authUid) {
+          protectedAuthUids.add(uData.authUid);
+        }
+      }
+    }
+    if (keptAdminUid === actor.uid && actor.authUid) {
+      protectedAuthUids.add(actor.authUid);
+    }
+
     const bindingAndPrivateOps: Array<(b: WriteBatch) => void> = [];
     const userDeleteOps: Array<(b: WriteBatch) => void> = [];
     for (const uDoc of usersSnap.docs) {
-      const uData = uDoc.data() as Record<string, unknown>;
-      if (uDoc.id === actor.uid || uDoc.id === defaultAdminUid) {
+      if (uDoc.id === keptAdminUid) {
         continue;
       }
-      if (typeof uData.authUid === 'string' && uData.authUid) {
+      const uData = uDoc.data() as Record<string, unknown>;
+      if (
+        typeof uData.authUid === 'string' &&
+        uData.authUid &&
+        !protectedAuthUids.has(uData.authUid)
+      ) {
         const bUid = uData.authUid;
-        bindingAndPrivateOps.push((b) => b.delete(doc(db, 'authBindings', bUid)));
-        deletedDocs += 1;
+        try {
+          const bSnap = await getDocFromServer(doc(db, 'authBindings', bUid));
+          if (
+            bSnap.exists() &&
+            bSnap.data()?.userId === uDoc.id &&
+            bSnap.data()?.userId !== keptAdminUid &&
+            bSnap.data()?.userId !== defaultAdminUid
+          ) {
+            bindingAndPrivateOps.push((b) => b.delete(doc(db, 'authBindings', bUid)));
+            deletedDocs += 1;
+          }
+        } catch {
+          // ignore unowned or missing authBindings
+        }
       }
-      bindingAndPrivateOps.push((b) => b.delete(doc(db, 'users', uDoc.id, 'private', 'info')));
+      try {
+        const privRef = doc(db, 'users', uDoc.id, 'private', 'info');
+        const privSnap = await getDocFromServer(privRef);
+        if (privSnap.exists()) {
+          bindingAndPrivateOps.push((b) => b.delete(privRef));
+          deletedDocs += 1;
+        }
+      } catch {
+        // ignore missing private/info
+      }
       userDeleteOps.push((b) => b.delete(uDoc.ref));
       deletedDocs += 1;
     }
-    if (bindingAndPrivateOps.length > 0) await runBatchOps(bindingAndPrivateOps);
+    if (bindingAndPrivateOps.length > 0) await runBatchOps(bindingAndPrivateOps, 8);
     if (userDeleteOps.length > 0) await runBatchOps(userDeleteOps);
 
-    // 6. Normalize kept Admin account as pure ADMIN (encrypted)
+    // 6. Normalize the sole kept Admin account as pure ADMIN (encrypted) & ensure binding
+    currentStep = 'normalize_admin';
     const spaceKey = await getOrInitSpaceAesKey(spaceId);
-    const actorSnap = await getDocFromServer(doc(db, 'users', actor.uid));
+    const actorSnap = await getDocFromServer(doc(db, 'users', keptAdminUid));
     const actorRaw = actorSnap.exists() ? (actorSnap.data() as Record<string, unknown>) : null;
+    const decodedKeptAdmin = actorRaw ? await decodeUserProfileDoc(actorRaw, spaceKey) : null;
+    const isActorTheKeptAdmin = actor.uid === keptAdminUid;
+
     const resolvedAuthUid =
       (actorRaw && typeof actorRaw.authUid === 'string' && actorRaw.authUid) ||
-      actor.authUid ||
-      '';
+      (isActorTheKeptAdmin ? actor.authUid : '') ||
+      auth.currentUser?.uid ||
+      keptAdminUid;
     const normalizedRoles: RoleCode[] = ['ADMIN'];
     const adminPayload: EncryptedAccountPayload = {
-      username: actor.username || DEFAULT_ADMIN_USERNAME,
-      employeeCode: actor.employeeCode || 'AD-01',
-      fullName: actor.fullName || 'Quản trị hệ thống',
+      username:
+        decodedKeptAdmin?.username ||
+        (isActorTheKeptAdmin ? actor.username : '') ||
+        DEFAULT_ADMIN_USERNAME,
+      employeeCode:
+        decodedKeptAdmin?.employeeCode ||
+        (isActorTheKeptAdmin ? actor.employeeCode : '') ||
+        'AD-01',
+      fullName:
+        decodedKeptAdmin?.fullName ||
+        (isActorTheKeptAdmin ? actor.fullName : '') ||
+        'Quản trị hệ thống',
       title: 'Quản trị hệ thống',
-      email: actor.email || '',
+      email: decodedKeptAdmin?.email || (isActorTheKeptAdmin ? actor.email : '') || '',
     };
     const encryptedAccount = await encryptAccountData(spaceKey, adminPayload);
 
-    await setDoc(doc(db, 'users', actor.uid), {
-      uid: actor.uid,
+    await setDoc(doc(db, 'users', keptAdminUid), {
+      uid: keptAdminUid,
       authUid: resolvedAuthUid,
       encryptedAccount,
       mustChangePassword: Boolean(actorRaw?.mustChangePassword),
@@ -1922,33 +2293,70 @@ export async function wipeAllDepartmentData(actor: UserProfile): Promise<{
       managerId: '',
       isActive: true,
       departmentId: spaceId,
-      createdAt: actorRaw?.createdAt || serverTimestamp(),
+      createdAt: isFirestoreTimestampValue(actorRaw?.createdAt)
+        ? actorRaw.createdAt
+        : serverTimestamp(),
       updatedAt: serverTimestamp(),
     });
 
+    if (
+      resolvedAuthUid &&
+      resolvedAuthUid !== keptAdminUid &&
+      resolvedAuthUid !== auth.currentUser?.uid
+    ) {
+      await upsertAuthBinding({
+        authUid: resolvedAuthUid,
+        userId: keptAdminUid,
+        departmentId: spaceId,
+        isActive: true,
+      });
+    }
+
+    const keptPrivRef = doc(db, 'users', keptAdminUid, 'private', 'info');
+    if (adminPayload.email) {
+      const encryptedPrivate = await encryptPrivateData(spaceKey, { email: adminPayload.email });
+      await setDoc(keptPrivRef, {
+        uid: keptAdminUid,
+        encryptedPrivate,
+        updatedAt: serverTimestamp(),
+      });
+    } else {
+      const keptPrivSnap = await getDocFromServer(keptPrivRef);
+      if (keptPrivSnap.exists()) {
+        await deleteDoc(keptPrivRef);
+      }
+    }
+
     const normalizedAdmin: UserProfile = {
-      ...actor,
+      uid: keptAdminUid,
       authUid: resolvedAuthUid,
       encryptedAccount,
-      title: 'Quản trị hệ thống',
+      mustChangePassword: Boolean(actorRaw?.mustChangePassword),
+      username: adminPayload.username,
+      employeeCode: adminPayload.employeeCode,
+      fullName: adminPayload.fullName,
+      title: adminPayload.title,
+      email: adminPayload.email,
       roles: normalizedRoles,
       groupId: '',
       managerId: '',
       isActive: true,
+      departmentId: spaceId,
     };
 
+    currentStep = 'audit_log';
     await logSystemAudit({
       actor: normalizedAdmin,
       action: 'Xóa toàn bộ dữ liệu',
       targetType: 'system',
       targetId: spaceId,
-      detail: `Đã xóa toàn bộ ${deletedDocs} bản ghi dữ liệu, chỉ giữ lại tài khoản Quản trị hệ thống (@${adminPayload.username})`,
+      detail: `Đã xóa toàn bộ ${deletedDocs} bản ghi dữ liệu và tất cả tài khoản khác, chỉ giữ lại duy nhất tài khoản Quản trị hệ thống (@${adminPayload.username})`,
       allUsers: [normalizedAdmin],
     });
 
     return { deletedDocs, normalizedAdmin };
   } catch (error) {
-    handleFirestoreError(error, OperationType.DELETE, `${spaceId}/wipeAll`);
+    handleFirestoreError(error, OperationType.DELETE, `${spaceId}/wipeAll/${currentStep}`);
   }
 }
 

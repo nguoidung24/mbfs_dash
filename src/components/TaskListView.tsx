@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { Search } from 'lucide-react';
+import { Search, SlidersHorizontal } from 'lucide-react';
 import {
   PRIORITY_LABELS,
   Project,
@@ -24,6 +24,10 @@ interface TaskListViewProps {
   users: UserProfile[];
   groups: WorkGroup[];
   projects: Project[];
+  filterUsers?: UserProfile[];
+  filterGroups?: WorkGroup[];
+  hideGroupFilter?: boolean;
+  hideAssigneeFilter?: boolean;
   onSelectTask: (task: TaskItem) => void;
   onCreateTask: () => void;
 }
@@ -33,6 +37,10 @@ export function TaskListView({
   users,
   groups,
   projects,
+  filterUsers,
+  filterGroups,
+  hideGroupFilter = false,
+  hideAssigneeFilter = false,
   onSelectTask,
   onCreateTask,
 }: TaskListViewProps) {
@@ -46,6 +54,19 @@ export function TaskListView({
   const [fromDate, setFromDate] = useState('');
   const [toDate, setToDate] = useState('');
   const [dateMode, setDateMode] = useState<TaskDateFilterMode>('DUE_DATE');
+  const [mobileFiltersOpen, setMobileFiltersOpen] = useState(false);
+
+  const selectableGroups = filterGroups ?? groups;
+  const selectableUsers = filterUsers ?? users;
+
+  const activeAdvancedFilterCount =
+    (projectId !== 'ALL' ? 1 : 0) +
+    (!hideGroupFilter && groupId !== 'ALL' ? 1 : 0) +
+    (!hideAssigneeFilter && assigneeId !== 'ALL' ? 1 : 0) +
+    (status !== 'ALL' ? 1 : 0) +
+    (priority !== 'ALL' ? 1 : 0) +
+    (onlyOverdue ? 1 : 0) +
+    (fromDate || toDate ? 1 : 0);
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -56,8 +77,8 @@ export function TaskListView({
       }
       if (projectId === 'REGULAR' && t.projectId) return false;
       if (projectId !== 'ALL' && projectId !== 'REGULAR' && t.projectId !== projectId) return false;
-      if (groupId !== 'ALL' && t.groupId !== groupId) return false;
-      if (assigneeId !== 'ALL' && t.assigneeId !== assigneeId) return false;
+      if (!hideGroupFilter && groupId !== 'ALL' && t.groupId !== groupId) return false;
+      if (!hideAssigneeFilter && assigneeId !== 'ALL' && t.assigneeId !== assigneeId) return false;
       if (status !== 'ALL' && t.status !== status) return false;
       if (priority !== 'ALL' && t.priority !== priority) return false;
       if (onlyOverdue && !isTaskOverdue(t)) return false;
@@ -67,7 +88,9 @@ export function TaskListView({
     tasks,
     search,
     projectId,
+    hideGroupFilter,
     groupId,
+    hideAssigneeFilter,
     assigneeId,
     status,
     priority,
@@ -80,119 +103,160 @@ export function TaskListView({
   return (
     <div className="space-y-4">
       {/* Filter Bar */}
-      <div className="bg-white border border-slate-200 rounded-xl p-4 space-y-3">
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-3">
-          <div className="lg:col-span-2 relative">
+      <div className="bg-white border border-slate-200 rounded-xl p-3 sm:p-4 space-y-3">
+        <div className="flex items-center gap-2 md:hidden">
+          <div className="relative flex-1 min-w-0">
             <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
             <input
               type="text"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              placeholder="Tìm theo mã việc hoặc tiêu đề..."
-              className="w-full pl-9 pr-3 py-1.5 text-sm border border-slate-300 rounded-lg focus:outline-none focus:border-blue-700"
+              placeholder="Tìm mã việc hoặc tiêu đề..."
+              className="w-full pl-9 pr-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:border-blue-700"
             />
           </div>
-
-          <select
-            value={projectId}
-            onChange={(e) => setProjectId(e.target.value)}
-            className="px-3 py-1.5 text-sm bg-white border border-slate-300 rounded-lg focus:outline-none focus:border-blue-700"
+          <button
+            type="button"
+            onClick={() => setMobileFiltersOpen((v) => !v)}
+            className={`inline-flex items-center gap-1.5 min-h-[38px] px-3 py-2 text-xs font-medium rounded-lg border whitespace-nowrap shrink-0 ${
+              mobileFiltersOpen || activeAdvancedFilterCount > 0
+                ? 'bg-blue-50 border-blue-200 text-blue-800'
+                : 'bg-white border-slate-300 text-slate-700'
+            }`}
           >
-            <option value="ALL">Tất cả dự án</option>
-            <option value="REGULAR">Việc thường xuyên</option>
-            {projects.map((p) => (
-              <option key={p.id} value={p.id}>
-                {p.code} — {p.name}
-              </option>
-            ))}
-          </select>
-
-          <select
-            value={groupId}
-            onChange={(e) => setGroupId(e.target.value)}
-            className="px-3 py-1.5 text-sm bg-white border border-slate-300 rounded-lg focus:outline-none focus:border-blue-700"
-          >
-            <option value="ALL">Tất cả nhóm việc</option>
-            {groups.map((g) => (
-              <option key={g.id} value={g.id}>
-                {g.name}
-              </option>
-            ))}
-          </select>
-
-          <select
-            value={assigneeId}
-            onChange={(e) => setAssigneeId(e.target.value)}
-            className="px-3 py-1.5 text-sm bg-white border border-slate-300 rounded-lg focus:outline-none focus:border-blue-700"
-          >
-            <option value="ALL">Tất cả nhân sự</option>
-            {users.map((u) => (
-              <option key={u.uid} value={u.uid}>
-                {u.fullName}
-              </option>
-            ))}
-          </select>
-
-          <select
-            value={status}
-            onChange={(e) => setStatus(e.target.value)}
-            className="px-3 py-1.5 text-sm bg-white border border-slate-300 rounded-lg focus:outline-none focus:border-blue-700"
-          >
-            <option value="ALL">Tất cả trạng thái</option>
-            {(Object.keys(TASK_STATUS_LABELS) as TaskStatus[]).map((st) => (
-              <option key={st} value={st}>
-                {TASK_STATUS_LABELS[st]}
-              </option>
-            ))}
-          </select>
+            <SlidersHorizontal className="w-3.5 h-3.5" />
+            <span>Bộ lọc{activeAdvancedFilterCount > 0 ? ` (${activeAdvancedFilterCount})` : ''}</span>
+          </button>
         </div>
 
-        <div className="pt-2 border-t border-slate-100">
-          <DateRangeFilterBar
-            fromDate={fromDate}
-            toDate={toDate}
-            dateMode={dateMode}
-            onFromDateChange={setFromDate}
-            onToDateChange={setToDate}
-            onDateModeChange={setDateMode}
-            onReset={() => {
-              setFromDate('');
-              setToDate('');
-            }}
-          />
-        </div>
+        <div className={`${mobileFiltersOpen ? 'block' : 'hidden'} md:block space-y-3`}>
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-3">
+            <div className="hidden md:block lg:col-span-2 relative">
+              <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+              <input
+                type="text"
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder="Tìm theo mã việc hoặc tiêu đề..."
+                className="w-full pl-9 pr-3 py-1.5 text-sm border border-slate-300 rounded-lg focus:outline-none focus:border-blue-700"
+              />
+            </div>
 
-        <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-slate-100 text-xs">
-          <div className="flex flex-wrap items-center gap-4">
-            <div className="flex items-center gap-2">
-              <span className="text-slate-500">Ưu tiên:</span>
+            <select
+              value={projectId}
+              onChange={(e) => setProjectId(e.target.value)}
+              className={`px-3 py-2 md:py-1.5 text-sm bg-white border border-slate-300 rounded-lg focus:outline-none focus:border-blue-700 ${
+                hideGroupFilter && hideAssigneeFilter ? 'lg:col-span-2' : ''
+              }`}
+            >
+              <option value="ALL">Tất cả dự án</option>
+              <option value="REGULAR">Việc thường xuyên</option>
+              {projects.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.code} — {p.name}
+                </option>
+              ))}
+            </select>
+
+            {!hideGroupFilter && (
               <select
-                value={priority}
-                onChange={(e) => setPriority(e.target.value)}
-                className="px-2.5 py-1 text-xs bg-white border border-slate-300 rounded-md"
+                value={groupId}
+                onChange={(e) => setGroupId(e.target.value)}
+                className="px-3 py-2 md:py-1.5 text-sm bg-white border border-slate-300 rounded-lg focus:outline-none focus:border-blue-700"
               >
-                <option value="ALL">Tất cả</option>
-                {(Object.keys(PRIORITY_LABELS) as TaskPriority[]).map((p) => (
-                  <option key={p} value={p}>
-                    {PRIORITY_LABELS[p]}
+                <option value="ALL">Tất cả nhóm việc</option>
+                {selectableGroups.map((g) => (
+                  <option key={g.id} value={g.id}>
+                    {g.name}
                   </option>
                 ))}
               </select>
-            </div>
+            )}
 
-            <label className="inline-flex items-center gap-2 text-slate-700 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={onlyOverdue}
-                onChange={(e) => setOnlyOverdue(e.target.checked)}
-                className="rounded border-slate-300 text-blue-700"
-              />
-              <span>Chỉ hiện việc quá hạn</span>
-            </label>
+            {!hideAssigneeFilter && (
+              <select
+                value={assigneeId}
+                onChange={(e) => setAssigneeId(e.target.value)}
+                className="px-3 py-2 md:py-1.5 text-sm bg-white border border-slate-300 rounded-lg focus:outline-none focus:border-blue-700"
+              >
+                <option value="ALL">Tất cả nhân sự</option>
+                {selectableUsers.map((u) => (
+                  <option key={u.uid} value={u.uid}>
+                    {u.fullName}
+                  </option>
+                ))}
+              </select>
+            )}
+
+            <select
+              value={status}
+              onChange={(e) => setStatus(e.target.value)}
+              className={`px-3 py-2 md:py-1.5 text-sm bg-white border border-slate-300 rounded-lg focus:outline-none focus:border-blue-700 ${
+                hideGroupFilter && hideAssigneeFilter ? 'lg:col-span-2' : ''
+              }`}
+            >
+              <option value="ALL">Tất cả trạng thái</option>
+              {(Object.keys(TASK_STATUS_LABELS) as TaskStatus[]).map((st) => (
+                <option key={st} value={st}>
+                  {TASK_STATUS_LABELS[st]}
+                </option>
+              ))}
+            </select>
           </div>
 
-          <span className="text-slate-500 tabular-nums">
-            Hiển thị {filtered.length} / {tasks.length} công việc
+          <div className="pt-2 border-t border-slate-100">
+            <DateRangeFilterBar
+              fromDate={fromDate}
+              toDate={toDate}
+              dateMode={dateMode}
+              onFromDateChange={setFromDate}
+              onToDateChange={setToDate}
+              onDateModeChange={setDateMode}
+              onReset={() => {
+                setFromDate('');
+                setToDate('');
+              }}
+            />
+          </div>
+
+          <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-slate-100 text-xs">
+            <div className="flex flex-wrap items-center gap-4">
+              <div className="flex items-center gap-2">
+                <span className="text-slate-500">Ưu tiên:</span>
+                <select
+                  value={priority}
+                  onChange={(e) => setPriority(e.target.value)}
+                  className="px-2.5 py-1.5 md:py-1 text-xs bg-white border border-slate-300 rounded-md"
+                >
+                  <option value="ALL">Tất cả</option>
+                  {(Object.keys(PRIORITY_LABELS) as TaskPriority[]).map((p) => (
+                    <option key={p} value={p}>
+                      {PRIORITY_LABELS[p]}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <label className="inline-flex items-center gap-2 text-slate-700 cursor-pointer min-h-[36px] md:min-h-0">
+                <input
+                  type="checkbox"
+                  checked={onlyOverdue}
+                  onChange={(e) => setOnlyOverdue(e.target.checked)}
+                  className="rounded border-slate-300 text-blue-700"
+                />
+                <span>Chỉ hiện việc quá hạn</span>
+              </label>
+            </div>
+
+            <span className="text-slate-500 tabular-nums">
+              Hiển thị {filtered.length} / {tasks.length} công việc
+            </span>
+          </div>
+        </div>
+
+        <div className="flex items-center justify-between text-xs text-slate-500 tabular-nums md:hidden">
+          <span>
+            Hiển thị <strong className="text-slate-900">{filtered.length}</strong> / {tasks.length} công việc
           </span>
         </div>
       </div>
@@ -213,70 +277,122 @@ export function TaskListView({
             </button>
           </div>
         ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full text-left border-collapse">
-              <thead>
-                <tr className="border-b border-slate-200 bg-slate-50 text-xs font-medium text-slate-500">
-                  <th className="py-2.5 px-4">Mã việc</th>
-                  <th className="py-2.5 px-4">Tiêu đề & Dự án</th>
-                  <th className="py-2.5 px-4">Nhóm</th>
-                  <th className="py-2.5 px-4">Người thực hiện</th>
-                  <th className="py-2.5 px-4">Ưu tiên</th>
-                  <th className="py-2.5 px-4">Trạng thái</th>
-                  <th className="py-2.5 px-4 text-right">Hạn hoàn thành</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-100 text-sm">
-                {filtered.map((task) => {
-                  const assignee = users.find((u) => u.uid === task.assigneeId);
-                  const group = groups.find((g) => g.id === task.groupId);
-                  const project = task.projectId
-                    ? projects.find((p) => p.id === task.projectId)
-                    : null;
-                  const overdue = isTaskOverdue(task);
+          <>
+            {/* Mobile Tap Cards (< md) */}
+            <div className="md:hidden divide-y divide-slate-100">
+              {filtered.map((task) => {
+                const assignee = users.find((u) => u.uid === task.assigneeId);
+                const group = groups.find((g) => g.id === task.groupId);
+                const project = task.projectId
+                  ? projects.find((p) => p.id === task.projectId)
+                  : null;
+                const overdue = isTaskOverdue(task);
 
-                  return (
-                    <tr
-                      key={task.id}
-                      onClick={() => onSelectTask(task)}
-                      className="hover:bg-slate-50 cursor-pointer transition-colors"
-                    >
-                      <td className="py-2.5 px-4 font-mono text-xs font-medium text-blue-700 whitespace-nowrap">
-                        {task.code}
-                      </td>
-                      <td className="py-2.5 px-4 min-w-[240px]">
-                        <div className="font-medium text-slate-900 line-clamp-1">
-                          {task.title}
-                        </div>
-                        <div className="text-xs text-slate-500 mt-0.5">
-                          {project ? `${project.code} · ${project.name}` : 'Việc thường xuyên'}
-                        </div>
-                      </td>
-                      <td className="py-2.5 px-4 text-xs text-slate-600 whitespace-nowrap">
-                        {group?.code || '—'}
-                      </td>
-                      <td className="py-2.5 px-4 text-xs text-slate-800 whitespace-nowrap">
-                        {assignee?.fullName || '—'}
-                      </td>
-                      <td className="py-2.5 px-4">
+                return (
+                  <button
+                    key={task.id}
+                    type="button"
+                    onClick={() => onSelectTask(task)}
+                    className="w-full text-left p-4 hover:bg-slate-50 active:bg-slate-100 transition-colors space-y-2"
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="flex items-center gap-2 min-w-0 text-xs">
+                        <span className="font-mono font-semibold text-blue-700 shrink-0">
+                          {task.code}
+                        </span>
+                        <span className="text-slate-300" aria-hidden="true">·</span>
                         <PriorityLabel priority={task.priority} />
-                      </td>
-                      <td className="py-2.5 px-4">
-                        <TaskStatusLabel status={task.status} isOverdue={overdue} />
-                      </td>
-                      <td
-                        className={`py-2.5 px-4 text-right text-xs tabular-nums whitespace-nowrap ${
-                          overdue ? 'text-red-700 font-semibold' : 'text-slate-600'
+                      </div>
+                      <TaskStatusLabel status={task.status} isOverdue={overdue} />
+                    </div>
+
+                    <div className="text-sm font-medium text-slate-900 leading-snug line-clamp-2">
+                      {task.title}
+                    </div>
+
+                    <div className="flex items-center justify-between gap-2 text-xs text-slate-500">
+                      <span className="truncate">
+                        {assignee?.fullName || '—'} · {project ? project.code : group?.code || 'Thường xuyên'}
+                      </span>
+                      <span
+                        className={`tabular-nums shrink-0 ${
+                          overdue ? 'text-red-700 font-semibold' : ''
                         }`}
                       >
-                        {formatDisplayDate(task.dueDate)}
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
+                        Hạn: {formatDisplayDate(task.dueDate)}
+                      </span>
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+
+            {/* Desktop Table (>= md) */}
+            <div className="hidden md:block overflow-x-auto">
+              <table className="w-full text-left border-collapse">
+                <thead>
+                  <tr className="border-b border-slate-200 bg-slate-50 text-xs font-medium text-slate-500">
+                    <th className="py-2.5 px-4">Mã việc</th>
+                    <th className="py-2.5 px-4">Tiêu đề & Dự án</th>
+                    <th className="py-2.5 px-4">Nhóm</th>
+                    <th className="py-2.5 px-4">Người thực hiện</th>
+                    <th className="py-2.5 px-4">Ưu tiên</th>
+                    <th className="py-2.5 px-4">Trạng thái</th>
+                    <th className="py-2.5 px-4 text-right">Hạn hoàn thành</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100 text-sm">
+                  {filtered.map((task) => {
+                    const assignee = users.find((u) => u.uid === task.assigneeId);
+                    const group = groups.find((g) => g.id === task.groupId);
+                    const project = task.projectId
+                      ? projects.find((p) => p.id === task.projectId)
+                      : null;
+                    const overdue = isTaskOverdue(task);
+
+                    return (
+                      <tr
+                        key={task.id}
+                        onClick={() => onSelectTask(task)}
+                        className="hover:bg-slate-50 cursor-pointer transition-colors"
+                      >
+                        <td className="py-2.5 px-4 font-mono text-xs font-medium text-blue-700 whitespace-nowrap">
+                          {task.code}
+                        </td>
+                        <td className="py-2.5 px-4 min-w-[240px]">
+                          <div className="font-medium text-slate-900 line-clamp-1">
+                            {task.title}
+                          </div>
+                          <div className="text-xs text-slate-500 mt-0.5">
+                            {project ? `${project.code} · ${project.name}` : 'Việc thường xuyên'}
+                          </div>
+                        </td>
+                        <td className="py-2.5 px-4 text-xs text-slate-600 whitespace-nowrap">
+                          {group?.code || '—'}
+                        </td>
+                        <td className="py-2.5 px-4 text-xs text-slate-800 whitespace-nowrap">
+                          {assignee?.fullName || '—'}
+                        </td>
+                        <td className="py-2.5 px-4">
+                          <PriorityLabel priority={task.priority} />
+                        </td>
+                        <td className="py-2.5 px-4">
+                          <TaskStatusLabel status={task.status} isOverdue={overdue} />
+                        </td>
+                        <td
+                          className={`py-2.5 px-4 text-right text-xs tabular-nums whitespace-nowrap ${
+                            overdue ? 'text-red-700 font-semibold' : 'text-slate-600'
+                          }`}
+                        >
+                          {formatDisplayDate(task.dueDate)}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </>
         )}
       </div>
     </div>

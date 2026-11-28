@@ -49,7 +49,13 @@ import {
 } from './lib/firestoreService';
 import {
   canViewAdminSection,
+  getScopedGroups,
+  getScopedUsers,
+  getUserScopeTier,
+  getVisibleAuditLogs,
+  getVisibleProjects,
   getVisibleTasks,
+  getVisibleWorkLogs,
   isAdminUser,
   isLeadershipUser,
 } from './lib/rbac';
@@ -288,26 +294,22 @@ function AppContent() {
     };
   }, [authReady, currentUser?.uid, mustChangePassword, syncSuspended]);
 
-  const visibleProjects = useMemo(() => {
-    if (!currentUser) return [];
-    if (isLeadershipUser(currentUser)) return projects;
-    return projects.filter(
-      (p) => p.pmId === currentUser.uid || p.memberIds.includes(currentUser.uid)
-    );
-  }, [currentUser, projects]);
+  const userTier = useMemo(() => getUserScopeTier(currentUser), [currentUser]);
 
-  const visibleTasks = useMemo(
-    () => getVisibleTasks(currentUser, tasks, visibleProjects),
-    [currentUser, tasks, visibleProjects]
+  const visibleProjects = useMemo(
+    () => getVisibleProjects(currentUser, projects),
+    [currentUser, projects]
   );
 
-  const visibleWorkLogs = useMemo(() => {
-    if (!currentUser) return [];
-    if (isLeadershipUser(currentUser)) return workLogs;
-    return workLogs.filter(
-      (w) => w.userId === currentUser.uid || w.viewerIds.includes(currentUser.uid)
-    );
-  }, [currentUser, workLogs]);
+  const visibleTasks = useMemo(
+    () => getVisibleTasks(currentUser, tasks, projects, groups),
+    [currentUser, tasks, projects, groups]
+  );
+
+  const visibleWorkLogs = useMemo(
+    () => getVisibleWorkLogs(currentUser, workLogs, visibleTasks, projects, groups),
+    [currentUser, workLogs, visibleTasks, projects, groups]
+  );
 
   const visibleUnlocks = useMemo(() => {
     if (!currentUser) return [];
@@ -315,11 +317,20 @@ function AppContent() {
     return unlocks.filter((ul) => ul.userId === currentUser.uid);
   }, [currentUser, unlocks]);
 
-  const visibleAuditLogs = useMemo(() => {
-    if (!currentUser) return [];
-    if (isLeadershipUser(currentUser)) return auditLogs;
-    return auditLogs.filter((a) => a.viewerIds.includes(currentUser.uid));
-  }, [currentUser, auditLogs]);
+  const visibleAuditLogs = useMemo(
+    () => getVisibleAuditLogs(currentUser, auditLogs, visibleTasks, projects),
+    [currentUser, auditLogs, visibleTasks, projects]
+  );
+
+  const scopedUsers = useMemo(
+    () => getScopedUsers(currentUser, users, projects, groups),
+    [currentUser, users, projects, groups]
+  );
+
+  const scopedGroups = useMemo(
+    () => getScopedGroups(currentUser, groups),
+    [currentUser, groups]
+  );
 
   const selectedTask = useMemo(
     () => visibleTasks.find((t) => t.id === selectedTaskId) || null,
@@ -385,7 +396,7 @@ function AppContent() {
   ];
 
   return (
-    <div className="min-h-screen bg-slate-50 flex">
+    <div className="min-h-screen bg-slate-50 flex w-full overflow-x-clip">
       {/* Desktop Left Sidebar */}
       <aside className="hidden lg:flex lg:w-64 lg:flex-col lg:fixed lg:inset-y-0 bg-white border-r border-slate-200 z-30">
         <div className="h-14 px-5 flex items-center gap-2.5 border-b border-slate-200">
@@ -478,12 +489,12 @@ function AppContent() {
       {/* Main Content Shell */}
       <div className="flex-1 lg:pl-64 flex flex-col min-w-0">
         {/* Top Header */}
-        <header className="sticky top-0 z-20 h-14 bg-white border-b border-slate-200 px-4 sm:px-6 flex items-center justify-between gap-4">
-          <div className="flex items-center gap-3 min-w-0">
+        <header className="sticky top-0 z-20 h-14 bg-white/95 backdrop-blur-md border-b border-slate-200 px-3 sm:px-6 flex items-center justify-between gap-2 sm:gap-4">
+          <div className="flex items-center gap-2 sm:gap-3 min-w-0">
             <button
               type="button"
               onClick={() => setMobileMenuOpen(true)}
-              className="lg:hidden p-1.5 rounded-lg text-slate-600 hover:bg-slate-100"
+              className="lg:hidden min-w-[44px] min-h-[44px] -ml-1.5 flex items-center justify-center rounded-lg text-slate-600 hover:bg-slate-100"
               aria-label="Mở menu"
             >
               <Menu className="w-5 h-5" />
@@ -495,13 +506,13 @@ function AppContent() {
               <span className="hidden sm:inline text-slate-300" aria-hidden="true">
                 /
               </span>
-              <h1 className="font-semibold text-slate-900 truncate">
+              <h1 className="font-semibold text-slate-900 truncate text-sm sm:text-base">
                 {SECTION_TITLES[activeNav]}
               </h1>
             </div>
           </div>
 
-          <div className="flex items-center gap-3 shrink-0">
+          <div className="flex items-center gap-2 sm:gap-3 shrink-0">
             <button
               type="button"
               onClick={() => {
@@ -509,17 +520,18 @@ function AppContent() {
                 setCreateTaskProjectId('');
                 setCreateTaskOpen(true);
               }}
-              className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-white bg-blue-700 rounded-lg hover:bg-blue-800 transition-colors whitespace-nowrap shrink-0"
+              className="inline-flex items-center justify-center gap-1.5 min-h-[38px] sm:min-h-0 px-3 sm:px-3.5 py-2 text-xs font-medium text-white bg-blue-700 rounded-lg hover:bg-blue-800 transition-colors whitespace-nowrap shrink-0"
             >
               <Plus className="w-4 h-4" />
-              <span>Giao việc / Tạo việc</span>
+              <span className="sm:hidden">Tạo việc</span>
+              <span className="hidden sm:inline">Giao việc / Tạo việc</span>
             </button>
 
             <div className="relative">
               <button
                 type="button"
                 onClick={() => setUserMenuOpen((v) => !v)}
-                className="px-3 py-1.5 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-lg whitespace-nowrap"
+                className="min-h-[38px] sm:min-h-0 px-2.5 sm:px-3 py-1.5 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-lg whitespace-nowrap"
               >
                 {currentUser.employeeCode}
               </button>
@@ -538,7 +550,7 @@ function AppContent() {
                       setUserMenuOpen(false);
                       setChangePassOpen(true);
                     }}
-                    className="w-full flex items-center gap-2 px-4 py-2 text-xs text-slate-700 hover:bg-slate-50 text-left"
+                    className="w-full flex items-center gap-2 px-4 py-2.5 text-xs text-slate-700 hover:bg-slate-50 text-left"
                   >
                     <KeyRound className="w-3.5 h-3.5" />
                     Đổi mật khẩu
@@ -546,7 +558,7 @@ function AppContent() {
                   <button
                     type="button"
                     onClick={handleLogout}
-                    className="w-full flex items-center gap-2 px-4 py-2 text-xs text-red-700 hover:bg-red-50 text-left"
+                    className="w-full flex items-center gap-2 px-4 py-2.5 text-xs text-red-700 hover:bg-red-50 text-left"
                   >
                     <LogOut className="w-3.5 h-3.5" />
                     Đăng xuất
@@ -558,16 +570,20 @@ function AppContent() {
         </header>
 
         {/* Main Viewport */}
-        <main className="flex-1 p-4 sm:p-6 max-w-[1440px] w-full mx-auto">
+        <main className="flex-1 min-w-0 px-3 py-4 pb-24 sm:p-6 lg:pb-6 max-w-[1440px] w-full mx-auto">
           {activeNav === 'DASHBOARD' && (
             <DashboardView
+              currentUser={currentUser}
               tasks={visibleTasks}
               projects={visibleProjects}
-              users={users}
-              groups={groups}
+              scopedUsers={scopedUsers}
+              allUsers={users}
+              groups={scopedGroups}
               workLogs={visibleWorkLogs}
               onSelectTask={(t) => setSelectedTaskId(t.id)}
               onNavigateList={() => setActiveNav('LIST')}
+              onNavigateAdmin={() => setActiveNav('ADMIN')}
+              onNavigateProjects={() => setActiveNav('PROJECTS')}
               onCreateTask={() => {
                 setEditingTask(null);
                 setCreateTaskProjectId('');
@@ -610,6 +626,13 @@ function AppContent() {
               users={users}
               groups={groups}
               projects={visibleProjects}
+              filterUsers={scopedUsers}
+              filterGroups={scopedGroups}
+              hideGroupFilter={
+                userTier === 'STAFF' ||
+                (userTier === 'SCOPE_MANAGER' && scopedGroups.length === 0)
+              }
+              hideAssigneeFilter={userTier === 'STAFF'}
               onSelectTask={(t) => setSelectedTaskId(t.id)}
               onCreateTask={() => {
                 setEditingTask(null);
@@ -643,6 +666,8 @@ function AppContent() {
               currentUser={currentUser}
               users={users}
               tasks={visibleTasks}
+              projects={visibleProjects}
+              groups={scopedGroups}
               workLogs={visibleWorkLogs}
               unlocks={visibleUnlocks}
               config={config}
@@ -709,8 +734,44 @@ function AppContent() {
         onSuccess={showToast}
       />
 
+      {/* Mobile Fixed Bottom Thumb Navigation (< lg) */}
+      <nav
+        aria-label="Điều hướng nhanh"
+        className="lg:hidden fixed bottom-0 left-0 right-0 z-30 bg-white/95 backdrop-blur-md border-t border-slate-200 pb-safe"
+      >
+        <div className="grid grid-cols-5 h-14 items-center">
+          {(
+            [
+              { id: 'DASHBOARD', label: 'Tổng quan', icon: BarChart3 },
+              { id: 'WORKSPACE', label: 'Của tôi', icon: LayoutDashboard },
+              { id: 'KANBAN', label: 'Bảng việc', icon: Kanban },
+              { id: 'LIST', label: 'Danh sách', icon: ListTodo },
+              { id: 'WORKLOGS', label: 'Nhật ký', icon: CalendarClock },
+            ] as Array<{ id: NavSection; label: string; icon: typeof LayoutDashboard }>
+          ).map((tabItem) => {
+            const Icon = tabItem.icon;
+            const active = activeNav === tabItem.id;
+            return (
+              <button
+                key={tabItem.id}
+                type="button"
+                onClick={() => setActiveNav(tabItem.id)}
+                className={`flex flex-col items-center justify-center h-full min-h-[44px] gap-0.5 transition-colors ${
+                  active ? 'text-blue-700' : 'text-slate-500 hover:text-slate-900'
+                }`}
+              >
+                <Icon className="w-5 h-5 shrink-0" />
+                <span className="text-[10px] font-medium tracking-tight leading-none truncate max-w-[68px]">
+                  {tabItem.label}
+                </span>
+              </button>
+            );
+          })}
+        </div>
+      </nav>
+
       {toast && (
-        <div className="fixed bottom-5 right-5 z-50 flex items-center gap-2 px-4 py-2.5 bg-slate-900 text-white text-xs font-medium rounded-lg shadow-lg">
+        <div className="fixed bottom-20 lg:bottom-5 left-3 right-3 sm:left-auto sm:right-5 z-50 flex items-center gap-2 px-4 py-2.5 bg-slate-900 text-white text-xs font-medium rounded-lg shadow-lg">
           <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
           <span>{toast}</span>
         </div>

@@ -473,7 +473,7 @@ export function AdminView({
       setWipeModalOpen(false);
       setWipeConfirmText('');
       setImportResult(null);
-      onNotify(`Đã xóa ${res.deletedDocs} bản ghi dữ liệu, chỉ giữ lại tài khoản Admin.`);
+      onNotify(`Đã xóa ${res.deletedDocs} bản ghi dữ liệu và toàn bộ tài khoản khác, chỉ giữ lại tài khoản Quản trị (@${res.normalizedAdmin.username || 'mbfs_admin'}).`);
     } catch (err) {
       setDataError(err instanceof Error ? err.message : 'Không thể xóa dữ liệu.');
     } finally {
@@ -528,12 +528,12 @@ export function AdminView({
 
   return (
     <div className="space-y-5">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="inline-flex flex-wrap p-1 bg-slate-100 rounded-lg gap-1">
+      <div className="flex flex-col sm:flex-row sm:flex-wrap sm:items-center justify-between gap-3">
+        <div className="flex sm:inline-flex items-center p-1 bg-slate-100 rounded-lg gap-1 overflow-x-auto no-scrollbar max-w-full">
           <button
             type="button"
             onClick={() => setTab('USERS')}
-            className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md whitespace-nowrap ${
+            className={`inline-flex items-center gap-1.5 px-3 py-2 sm:py-1.5 text-xs font-medium rounded-md whitespace-nowrap shrink-0 ${
               tab === 'USERS' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600'
             }`}
           >
@@ -543,7 +543,7 @@ export function AdminView({
           <button
             type="button"
             onClick={() => setTab('GROUPS')}
-            className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md whitespace-nowrap ${
+            className={`inline-flex items-center gap-1.5 px-3 py-2 sm:py-1.5 text-xs font-medium rounded-md whitespace-nowrap shrink-0 ${
               tab === 'GROUPS' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600'
             }`}
           >
@@ -553,7 +553,7 @@ export function AdminView({
           <button
             type="button"
             onClick={() => setTab('CONFIG')}
-            className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md whitespace-nowrap ${
+            className={`inline-flex items-center gap-1.5 px-3 py-2 sm:py-1.5 text-xs font-medium rounded-md whitespace-nowrap shrink-0 ${
               tab === 'CONFIG' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600'
             }`}
           >
@@ -564,7 +564,7 @@ export function AdminView({
             <button
               type="button"
               onClick={() => setTab('DATA')}
-              className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md whitespace-nowrap ${
+              className={`inline-flex items-center gap-1.5 px-3 py-2 sm:py-1.5 text-xs font-medium rounded-md whitespace-nowrap shrink-0 ${
                 tab === 'DATA' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600'
               }`}
             >
@@ -575,7 +575,7 @@ export function AdminView({
           <button
             type="button"
             onClick={() => setTab('AUDIT')}
-            className={`px-3 py-1.5 text-xs font-medium rounded-md whitespace-nowrap ${
+            className={`px-3 py-2 sm:py-1.5 text-xs font-medium rounded-md whitespace-nowrap shrink-0 ${
               tab === 'AUDIT' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600'
             }`}
           >
@@ -587,7 +587,7 @@ export function AdminView({
           <button
             type="button"
             onClick={openCreateUser}
-            className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-medium text-white bg-blue-700 rounded-lg hover:bg-blue-800 whitespace-nowrap"
+            className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2 sm:py-1.5 text-xs font-medium text-white bg-blue-700 rounded-lg hover:bg-blue-800 whitespace-nowrap"
           >
             <Plus className="w-3.5 h-3.5" />
             Tạo tài khoản nhân sự
@@ -598,7 +598,7 @@ export function AdminView({
           <button
             type="button"
             onClick={openCreateGroup}
-            className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-medium text-white bg-blue-700 rounded-lg hover:bg-blue-800 whitespace-nowrap"
+            className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2 sm:py-1.5 text-xs font-medium text-white bg-blue-700 rounded-lg hover:bg-blue-800 whitespace-nowrap"
           >
             <Plus className="w-3.5 h-3.5" />
             Thêm nhóm việc
@@ -665,7 +665,112 @@ export function AdminView({
           )}
 
           <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
-            <div className="overflow-x-auto">
+            {/* Mobile User Cards (< md) */}
+            <div className="md:hidden divide-y divide-slate-100">
+              {users.map((u) => {
+                const grp = groups.find((g) => g.id === u.groupId);
+                const mgr = users.find((m) => m.uid === u.managerId);
+                const isDup = duplicatedUidSet.has(u.uid);
+                return (
+                  <div key={u.uid} className="p-4 space-y-2.5">
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2 text-xs">
+                          <span className="font-mono font-medium text-slate-600">
+                            {u.employeeCode}
+                          </span>
+                          <span className="text-slate-300" aria-hidden="true">·</span>
+                          <span className="font-mono text-slate-700 truncate">
+                            {u.username ? `@${u.username}` : '—'}
+                          </span>
+                        </div>
+                        <div className="text-sm font-semibold text-slate-900 mt-0.5">
+                          {u.fullName}
+                        </div>
+                        <div className="text-xs text-slate-500">
+                          {u.title || '—'} · {grp?.name || 'Chưa phân nhóm'}
+                        </div>
+                        {isDup && (
+                          <div className="text-[11px] font-mono text-amber-700 mt-0.5 break-all">
+                            ID: {u.uid}
+                          </div>
+                        )}
+                      </div>
+                      <span
+                        className={`text-xs whitespace-nowrap shrink-0 ${
+                          !u.isActive
+                            ? 'text-red-700 font-medium'
+                            : u.authUid
+                            ? 'text-emerald-700 font-medium'
+                            : 'text-amber-700 font-medium'
+                        }`}
+                      >
+                        {!u.isActive
+                          ? 'Đã khóa'
+                          : u.authUid
+                          ? 'Đang hoạt động'
+                          : 'Chưa kích hoạt Auth'}
+                      </span>
+                    </div>
+
+                    <div className="text-xs text-slate-600">
+                      <span>{u.roles.map((r) => ROLE_LABELS[r]).join(' · ')}</span>
+                      {mgr && (
+                        <>
+                          <span className="mx-1.5 text-slate-300">·</span>
+                          <span>Cấp trên: {mgr.fullName}</span>
+                        </>
+                      )}
+                    </div>
+
+                    {isAdmin && (
+                      <div className="flex flex-wrap items-center gap-3 pt-1">
+                        <button
+                          type="button"
+                          onClick={() => openEditUser(u)}
+                          className="inline-flex items-center gap-1 min-h-[36px] px-2.5 py-1.5 text-xs font-medium text-blue-700 bg-blue-50 rounded-lg"
+                        >
+                          <Edit3 className="w-3.5 h-3.5" />
+                          Sửa
+                        </button>
+                        {!u.authUid && (
+                          <button
+                            type="button"
+                            onClick={() => openActivateModal(u)}
+                            className="inline-flex items-center gap-1 min-h-[36px] px-2.5 py-1.5 text-xs font-medium text-amber-800 bg-amber-50 rounded-lg"
+                          >
+                            <KeyRound className="w-3.5 h-3.5" />
+                            Kích hoạt Auth
+                          </button>
+                        )}
+                        {u.uid !== currentUser.uid && (
+                          <button
+                            type="button"
+                            onClick={() => handleToggleLockUser(u)}
+                            className="inline-flex items-center gap-1 min-h-[36px] px-2.5 py-1.5 text-xs font-medium text-slate-700 bg-slate-100 rounded-lg"
+                          >
+                            {u.isActive ? (
+                              <>
+                                <Lock className="w-3.5 h-3.5" />
+                                Khóa
+                              </>
+                            ) : (
+                              <>
+                                <Unlock className="w-3.5 h-3.5" />
+                                Mở
+                              </>
+                            )}
+                          </button>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* Desktop Table (>= md) */}
+            <div className="hidden md:block overflow-x-auto">
               <table className="w-full text-left border-collapse">
                 <thead>
                   <tr className="border-b border-slate-200 bg-slate-50 text-xs font-medium text-slate-500">
@@ -1123,10 +1228,10 @@ export function AdminView({
               </div>
               <div className="space-y-1">
                 <h3 className="text-sm font-semibold text-red-900">
-                  Xóa toàn bộ dữ liệu hệ thống (chỉ giữ lại tài khoản Admin)
+                  Xóa toàn bộ dữ liệu &amp; tài khoản (chỉ giữ lại tài khoản Quản trị)
                 </h3>
                 <p className="text-xs text-slate-600 leading-relaxed">
-                  Thao tác này sẽ xóa vĩnh viễn toàn bộ dự án, công việc, đầu việc con, bình luận, nhật ký làm việc, nhóm việc, cấu hình và tất cả tài khoản nhân sự khác — chỉ giữ lại duy nhất tài khoản Quản trị hệ thống hiện tại (@{currentUser.username}). Nên tải file Excel sao lưu trước khi xóa.
+                  Thao tác này sẽ xóa vĩnh viễn toàn bộ dự án, công việc, đầu việc con, bình luận, nhật ký làm việc, nhóm việc, cấu hình và <strong>tất cả các tài khoản nhân sự/lãnh đạo khác</strong> — chỉ giữ lại duy nhất tài khoản Quản trị hệ thống (@{currentUser.username}). Nên tải file Excel sao lưu trước khi xóa.
                 </p>
               </div>
             </div>
@@ -1173,28 +1278,28 @@ export function AdminView({
 
       {/* Create / Edit User Modal */}
       {userModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4">
-          <div className="bg-white border border-slate-200 rounded-xl w-full max-w-lg max-h-[90vh] flex flex-col">
-            <div className="flex items-center justify-between px-6 py-4 border-b border-slate-200">
-              <h3 className="text-base font-semibold text-slate-900">
+        <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-slate-900/40 p-0 sm:p-4">
+          <div className="bg-white border border-slate-200 rounded-t-2xl sm:rounded-xl w-full max-w-lg max-h-[92vh] flex flex-col pb-safe">
+            <div className="flex items-center justify-between px-4 sm:px-6 py-4 border-b border-slate-200">
+              <h3 className="text-base font-semibold text-slate-900 truncate pr-2">
                 {editingUser ? `Cập nhật ${editingUser.fullName}` : 'Tạo tài khoản nhân sự mới'}
               </h3>
               <button
                 type="button"
                 onClick={() => setUserModalOpen(false)}
-                className="p-1 text-slate-400 hover:text-slate-700"
+                className="p-1.5 text-slate-400 hover:text-slate-700"
               >
                 <X className="w-5 h-5" />
               </button>
             </div>
-            <form onSubmit={handleSaveUser} className="overflow-y-auto px-6 py-5 space-y-4">
+            <form onSubmit={handleSaveUser} className="overflow-y-auto px-4 sm:px-6 py-5 space-y-4">
               {userModalError && (
                 <div className="p-3 rounded-lg bg-red-50 border border-red-200 text-xs text-red-700">
                   {userModalError}
                 </div>
               )}
 
-              <div className="grid grid-cols-3 gap-3">
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                 <div>
                   <label className="block text-xs font-medium text-slate-700 mb-1">Mã NV *</label>
                   <input
@@ -1205,7 +1310,7 @@ export function AdminView({
                     className="w-full px-3 py-2 text-sm font-mono border border-slate-300 rounded-lg"
                   />
                 </div>
-                <div className="col-span-2">
+                <div className="sm:col-span-2">
                   <label className="block text-xs font-medium text-slate-700 mb-1">
                     Họ và tên *
                   </label>
@@ -1219,7 +1324,7 @@ export function AdminView({
                 </div>
               </div>
 
-              <div className="grid grid-cols-2 gap-3">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div>
                   <label className="block text-xs font-medium text-slate-700 mb-1">
                     Tên đăng nhập *
@@ -1273,7 +1378,7 @@ export function AdminView({
                 </p>
               )}
 
-              <div className="grid grid-cols-2 gap-3">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div>
                   <label className="block text-xs font-medium text-slate-700 mb-1">
                     Email liên hệ (mã hóa AES-256)
@@ -1301,7 +1406,7 @@ export function AdminView({
                 )}
               </div>
 
-              <div className="grid grid-cols-2 gap-3">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div>
                   <label className="block text-xs font-medium text-slate-700 mb-1">Nhóm việc</label>
                   <select
@@ -1340,7 +1445,7 @@ export function AdminView({
                 <label className="block text-xs font-medium text-slate-700 mb-1.5">
                   Vai trò hệ thống (RBAC - chọn nhiều)
                 </label>
-                <div className="grid grid-cols-2 gap-2">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                   {(Object.keys(ROLE_LABELS) as RoleCode[]).map((r) => (
                     <label
                       key={r}
@@ -1600,7 +1705,7 @@ export function AdminView({
             </div>
 
             <p className="text-xs text-slate-600 leading-relaxed">
-              Toàn bộ dự án, công việc, nhật ký làm việc, nhóm việc, cấu hình và tài khoản nhân sự khác sẽ bị xóa vĩnh viễn. Chỉ duy nhất tài khoản Quản trị hệ thống (<strong className="font-mono">@{currentUser.username}</strong>) được giữ lại.
+              Toàn bộ dự án, công việc, nhật ký làm việc, nhóm việc, cấu hình và <strong>tất cả tài khoản khác</strong> sẽ bị xóa vĩnh viễn. Chỉ duy nhất 1 tài khoản Quản trị hệ thống (<strong className="font-mono">@{currentUser.username}</strong>) được giữ lại.
             </p>
 
             <form onSubmit={handleWipeAllData} className="space-y-3">

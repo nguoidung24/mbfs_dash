@@ -121,6 +121,13 @@ service cloud.firestore {
       return isSpaceSuperAdmin(spaceId) || (isBoundUserInSpace(spaceId) && isLeadershipUser(authBinding().data.userId));
     }
 
+    function isSpaceDepartmentHeadOrAdmin(spaceId) {
+      return isSpaceSuperAdmin(spaceId) || (
+        isBoundUserInSpace(spaceId) &&
+        (isAdminUser(authBinding().data.userId) || userHasRole(authBinding().data.userId, 'TRUONG_PHONG'))
+      );
+    }
+
     // Vietnam Time (UTC+7) helpers for WorkLog date lock
     function vnTime() {
       return request.time + duration.time(7, 0, 0, 0);
@@ -415,6 +422,7 @@ service cloud.firestore {
     match /authBindings/{authUid} {
       allow get: if isValidId(authUid) && isSignedIn() && (
         request.auth.uid == authUid ||
+        (resource == null && isSpaceAdmin('DAMA2')) ||
         (resource != null && isSpaceAdmin(existing().departmentId))
       );
       allow list: if false;
@@ -434,13 +442,17 @@ service cloud.firestore {
         );
       allow update: if isValidId(authUid) && isSignedIn() &&
         isValidAuthBinding(incoming()) &&
-        incoming().authUid == existing().authUid &&
-        incoming().userId == existing().userId &&
-        incoming().departmentId == existing().departmentId &&
-        incoming().createdAt == existing().createdAt &&
+        incoming().authUid == authUid &&
+        (!('authUid' in existing()) || incoming().authUid == existing().authUid) &&
+        (!('departmentId' in existing()) || incoming().departmentId == existing().departmentId) &&
+        (
+          (('createdAt' in existing()) && (existing().createdAt is timestamp) && incoming().createdAt == existing().createdAt) ||
+          ((!('createdAt' in existing()) || !(existing().createdAt is timestamp)) && incoming().createdAt == request.time)
+        ) &&
         incoming().updatedAt == request.time &&
-        isSpaceAdmin(existing().departmentId);
+        isSpaceAdmin(incoming().departmentId);
       allow delete: if isValidId(authUid) && isSignedIn() &&
+        resource != null &&
         existing().userId != defaultAdminUid(existing().departmentId) &&
         isSpaceSuperAdmin(existing().departmentId);
     }
@@ -483,22 +495,27 @@ service cloud.firestore {
 
       allow update: if isValidId(userId) && isSignedIn() &&
         isValidUserProfile(incoming()) &&
-        incoming().uid == existing().uid &&
-        incoming().departmentId == existing().departmentId &&
-        incoming().createdAt == existing().createdAt &&
+        incoming().uid == userId &&
+        (!('uid' in existing()) || existing().uid == '' || incoming().uid == existing().uid) &&
+        (!('departmentId' in existing()) || incoming().departmentId == existing().departmentId) &&
+        (
+          (('createdAt' in existing()) && (existing().createdAt is timestamp) && incoming().createdAt == existing().createdAt) ||
+          ((!('createdAt' in existing()) || !(existing().createdAt is timestamp)) && incoming().createdAt == request.time)
+        ) &&
         incoming().updatedAt == request.time && (
-          isSpaceAdmin(existing().departmentId) ||
+          isSpaceAdmin(incoming().departmentId) ||
           (
             isBoundSelf(userId) &&
+            'authUid' in existing() &&
             incoming().authUid == existing().authUid &&
             incoming().roles == existing().roles &&
             incoming().isActive == existing().isActive &&
             incoming().diff(existing()).affectedKeys().hasOnly(['mustChangePassword', 'encryptedAccount', 'updatedAt'])
           ) ||
           (
-            userId == defaultAdminUid(existing().departmentId) &&
+            userId == defaultAdminUid(incoming().departmentId) &&
             (!('authUid' in existing()) || existing().authUid == '') &&
-            isBootstrapAdminCaller(existing().departmentId) &&
+            isBootstrapAdminCaller(incoming().departmentId) &&
             incoming().authUid == request.auth.uid &&
             incoming().roles == existing().roles &&
             incoming().isActive == true
@@ -576,7 +593,16 @@ service cloud.firestore {
         incoming().createdBy == existing().createdBy &&
         incoming().departmentId == existing().departmentId &&
         incoming().createdAt == existing().createdAt &&
-        incoming().updatedAt == request.time;
+        incoming().updatedAt == request.time && (
+          isSpaceDepartmentHeadOrAdmin(existing().departmentId) ||
+          (
+            !incoming().diff(existing()).affectedKeys().hasAny(['memberIds', 'pmId']) &&
+            (
+              isSpaceLeadership(existing().departmentId) ||
+              (hasAuthBinding() && existing().pmId == authBinding().data.userId)
+            )
+          )
+        );
 
       allow delete: if isValidId(projectId) && isSignedIn() && isSpaceSuperAdmin(existing().departmentId);
 
@@ -587,14 +613,26 @@ service cloud.firestore {
         allow list: if isValidId(projectId) && isSignedIn() &&
           exists(/databases/$(database)/documents/projects/$(projectId)) &&
           isSpaceMember(get(/databases/$(database)/documents/projects/$(projectId)).data.departmentId);
-        allow create, update: if isValidId(projectId) && isValidId(memberId) && isSignedIn() &&
+        allow create: if isValidId(projectId) && isValidId(memberId) && isSignedIn() &&
           isValidProjectMember(incoming()) &&
           incoming().joinedAt == request.time &&
-          exists(/databases/$(database)/documents/projects/$(projectId)) &&
-          isSpaceMember(get(/databases/$(database)/documents/projects/$(projectId)).data.departmentId);
+          existsAfter(/databases/$(database)/documents/projects/$(projectId)) && (
+            isSpaceDepartmentHeadOrAdmin(getAfter(/databases/$(database)/documents/projects/$(projectId)).data.departmentId) ||
+            (
+              !exists(/databases/$(database)/documents/projects/$(projectId)) &&
+              isSpaceMember(getAfter(/databases/$(database)/documents/projects/$(projectId)).data.departmentId) &&
+              hasAuthBinding() &&
+              getAfter(/databases/$(database)/documents/projects/$(projectId)).data.createdBy == authBinding().data.userId
+            )
+          );
+        allow update: if isValidId(projectId) && isValidId(memberId) && isSignedIn() &&
+          isValidProjectMember(incoming()) &&
+          incoming().joinedAt == request.time &&
+          existsAfter(/databases/$(database)/documents/projects/$(projectId)) &&
+          isSpaceDepartmentHeadOrAdmin(getAfter(/databases/$(database)/documents/projects/$(projectId)).data.departmentId);
         allow delete: if isValidId(projectId) && isValidId(memberId) && isSignedIn() &&
           exists(/databases/$(database)/documents/projects/$(projectId)) &&
-          isSpaceSuperAdmin(get(/databases/$(database)/documents/projects/$(projectId)).data.departmentId);
+          isSpaceDepartmentHeadOrAdmin(get(/databases/$(database)/documents/projects/$(projectId)).data.departmentId);
       }
     }
 
@@ -717,8 +755,13 @@ service cloud.firestore {
         isWorkLogDateEditable(existing().userId, existing().workDate, existing().workDateNum);
 
       allow delete: if isValidId(logId) && isSignedIn() && (
-        (isSpaceMember(existing().departmentId) && isActiveUser(existing().userId) && (isSpaceSuperAdmin(existing().departmentId) || existing().userId == authBinding().data.userId) && isWorkLogDateEditable(existing().userId, existing().workDate, existing().workDateNum)) ||
-        isSpaceSuperAdmin(existing().departmentId)
+        isSpaceSuperAdmin(existing().departmentId) ||
+        (
+          isSpaceMember(existing().departmentId) &&
+          isActiveUser(existing().userId) &&
+          existing().userId == authBinding().data.userId &&
+          isWorkLogDateEditable(existing().userId, existing().workDate, existing().workDateNum)
+        )
       );
     }
 

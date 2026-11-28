@@ -225,7 +225,7 @@ export function KanbanBoard({
         </div>
       </div>
 
-      <div className="flex gap-4 overflow-x-auto pb-4 items-start">
+      <div className="flex gap-3 sm:gap-4 overflow-x-auto snap-x snap-mandatory pb-4 items-start -mx-3 px-3 sm:mx-0 sm:px-0">
         {KANBAN_COLUMNS.map((colStatus) => {
           const colTasks = filteredTasks.filter((t) => t.status === colStatus);
           const isDragOver = dragOverCol === colStatus;
@@ -246,7 +246,7 @@ export function KanbanBoard({
                 const found = tasks.find((t) => t.id === taskId);
                 if (found) attemptMove(found, colStatus);
               }}
-              className={`w-[280px] shrink-0 rounded-xl border transition-colors ${
+              className={`w-[84vw] max-w-[320px] sm:w-[280px] shrink-0 snap-center rounded-xl border transition-colors ${
                 isDragOver
                   ? 'bg-blue-50/60 border-blue-400'
                   : 'bg-slate-100/70 border-slate-200'
@@ -331,7 +331,7 @@ export function KanbanBoard({
                             aria-label={`Chuyển trạng thái ${task.code}`}
                             value={task.status}
                             onChange={(e) => attemptMove(task, e.target.value as TaskStatus)}
-                            className="w-full px-2 py-1 text-xs bg-slate-50 border border-slate-200 rounded"
+                            className="w-full min-h-[40px] px-2.5 py-2 text-xs bg-slate-50 border border-slate-200 rounded-lg"
                           >
                             {KANBAN_COLUMNS.map((st) => (
                               <option key={st} value={st}>
